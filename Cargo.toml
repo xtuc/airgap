@@ -1,0 +1,14 @@
+[package]
+name = "airgap"
+version = "0.1.0"
+edition = "2024"
+authors = ["Sven Sauleau <sven@sauleau.com>"]
+description = "Hide sensitive secrets from AI models, while letting them do their work"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xtuc/airgap"
+
+[dependencies]
+fuser = "0.17"
+nix = { version = "0.31", features = ["mount", "sched", "process", "signal", "fs", "uio", "dir"] }
+dotenvy = "0.15"
+anyhow = "1.0.102"

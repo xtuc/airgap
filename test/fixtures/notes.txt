@@ -1,0 +1,2 @@
+Just some project notes. Nothing secret in here.
+This file should pass through airgap completely unchanged.
