@@ -2,10 +2,10 @@
 //! files transparently replaced by FUSE-backed, redacted versions that only that
 //! program (and its children) sees.
 //!
-//! See docs/design.md for the full design. The whole working directory is
-//! mounted through a FUSE overlay, so interception is dynamic: any file named
-//! `.env` (and any private key, by content) is redacted on access, including
-//! files created after launch.
+//! See docs/design.md for the full design. The working directory and the user's
+//! home directory are each mounted through a FUSE overlay, so interception is
+//! dynamic: any file named `.env` (and any private key, by content) is redacted
+//! on access, including files created after launch.
 
 mod fs;
 mod handlers;

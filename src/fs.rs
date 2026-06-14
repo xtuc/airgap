@@ -568,9 +568,9 @@ impl Filesystem for OverlayFs {
             }
         };
         let ino = self.intern(rel.clone());
-        // A freshly created file is empty; only `.env` gets a handler (a new key
-        // file has no header yet). Its redacted view starts empty too.
-        let handle = if name == OsStr::new(".env") {
+        // A freshly created file is empty; only `.env` files get a handler (a new
+        // key file has no header yet). Its redacted view starts empty too.
+        let handle = if handlers::is_env_file(name) {
             Handle::Env {
                 fd,
                 served: Vec::new(),

@@ -53,11 +53,21 @@ const KEY_HEADERS: &[&str] = &[
 /// it is quoted; the literal value (what a parser yields back) is this string.
 pub const PLACEHOLDER: &str = "<redacted value>";
 
+/// Whether a filename denotes a dotenv file: `.env` itself or any
+/// `.env.<suffix>` variant (e.g. `.env.local`, `.env.production`). Does not
+/// match unrelated names like `.envrc`.
+pub fn is_env_file(file_name: &OsStr) -> bool {
+    match file_name.to_str() {
+        Some(name) => name == ".env" || name.starts_with(".env."),
+        None => false,
+    }
+}
+
 /// Decide which handler applies, cheaply, without reading the whole file: by
 /// filename, or by sniffing the leading bytes for a private-key header (`prefix`
 /// only needs to contain the first line). Returns `None` for ordinary files.
 pub fn detect(file_name: &OsStr, prefix: &[u8]) -> Option<HandlerKind> {
-    if file_name == OsStr::new(".env") {
+    if is_env_file(file_name) {
         return Some(HandlerKind::Env);
     }
     let first_line = prefix.split(|&b| b == b'\n').next().unwrap_or(prefix);
@@ -279,6 +289,15 @@ mod tests {
     fn selection_by_filename_and_by_content() {
         // `.env` matches by name regardless of content.
         assert_eq!(detect(OsStr::new(".env"), b"K=v\n"), Some(HandlerKind::Env));
+        // `.env.<suffix>` variants match by name too.
+        assert_eq!(
+            detect(OsStr::new(".env.local"), b"K=v\n"),
+            Some(HandlerKind::Env)
+        );
+        assert_eq!(
+            detect(OsStr::new(".env.production"), b"K=v\n"),
+            Some(HandlerKind::Env)
+        );
         // A private key matches by content, regardless of filename.
         let key = b"-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n";
         assert_eq!(
@@ -287,5 +306,17 @@ mod tests {
         );
         // Ordinary files are passthrough.
         assert_eq!(detect(OsStr::new("notes.txt"), b"just text\n"), None);
+    }
+
+    #[test]
+    fn env_file_name_matching() {
+        assert!(is_env_file(OsStr::new(".env")));
+        assert!(is_env_file(OsStr::new(".env.local")));
+        assert!(is_env_file(OsStr::new(".env.production")));
+        // Unrelated dotfiles are not env files.
+        assert!(!is_env_file(OsStr::new(".envrc")));
+        assert!(!is_env_file(OsStr::new(".environment")));
+        assert!(!is_env_file(OsStr::new("env")));
+        assert!(!is_env_file(OsStr::new("notes.txt")));
     }
 }

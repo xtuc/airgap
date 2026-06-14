@@ -62,9 +62,12 @@ def test_plain_file_untouched(airgap):
 # --- .env redaction on read ------------------------------------------------
 
 
-def test_env_read_is_exactly_redacted(airgap):
-    expected = expected_env_redaction((airgap.workdir / ".env").read_text())
-    result = airgap("cat", ".env")
+# Both `.env` and any `.env.<suffix>` variant (e.g. `.env.production`) are
+# detected by name and redacted identically.
+@pytest.mark.parametrize("path", [".env", ".env.production"])
+def test_env_read_is_exactly_redacted(airgap, path):
+    expected = expected_env_redaction((airgap.workdir / path).read_text())
+    result = airgap("cat", path)
     assert result.returncode == 0
     assert result.stdout == expected
 
