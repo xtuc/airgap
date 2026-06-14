@@ -1,5 +1,6 @@
-//! Per-file content handlers: pure transforms over bytes, kept separate from the
-//! FUSE / mount plumbing so the security-critical parts are cheap to test.
+//! Secret redaction: the per-file content handlers, pure transforms over bytes,
+//! kept separate from the FUSE / mount plumbing so the security-critical parts
+//! are cheap to test.
 //!
 //! Read side: `original contents -> redacted contents`.
 //! Write side: `(original, edited-redacted-buffer) -> new original` (a merge).

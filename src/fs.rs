@@ -17,7 +17,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -33,7 +33,7 @@ use nix::sys::stat::{FileStat, Mode, SFlag, fstatat, mkdirat};
 use nix::sys::uio::{pread, pwrite};
 use nix::unistd::{UnlinkatFlags, ftruncate, symlinkat, unlinkat};
 
-use crate::handlers::{self, HandlerKind};
+use crate::redact::{self, HandlerKind};
 
 /// How long the kernel may cache attributes/entries before asking again.
 const TTL: Duration = Duration::from_secs(1);
@@ -153,18 +153,58 @@ impl Handles {
     }
 }
 
+/// What the wrapped program is trying to do to a file, passed to [`DirAccess`]
+/// so a gate can tell the user exactly what triggered a prompt. Only file
+/// operations are gated; directory listing is not.
+#[derive(Clone, Copy, Debug)]
+pub enum Access {
+    /// Open a file for reading.
+    Read,
+    /// Open a file for writing.
+    Write,
+    /// Create a new file.
+    Create,
+}
+
+/// A policy hook the overlay consults before letting the wrapped program access
+/// a file. Implementations may block (e.g. to prompt the user). `path` is the
+/// absolute path of the file being accessed; the implementation may grant at
+/// coarser (directory) granularity. Used to gate package managers; AI agents run
+/// with no gate.
+pub trait DirAccess: Send + Sync {
+    /// Return `true` to permit the access, `false` to deny it (the op returns
+    /// `EACCES`).
+    fn allow(&self, path: &Path, access: Access) -> bool;
+}
+
 /// The overlay filesystem.
 pub struct OverlayFs {
     /// `O_PATH` dir fd to the real working directory, captured before the mount.
     root: OwnedFd,
+    /// Absolute path of this overlay's mount root, used to form the absolute
+    /// directory paths handed to the access `gate`.
+    mount_root: PathBuf,
+    /// Whether to redact secret files. When `false`, every file is passed
+    /// through unchanged (the overlay is then transparent except for the gate).
+    redact: bool,
+    /// Optional directory-access gate (see [`DirAccess`]). `None` ⇒ unrestricted.
+    gate: Option<Arc<dyn DirAccess>>,
     inodes: Mutex<InodeTable>,
     handles: Mutex<Handles>,
 }
 
 impl OverlayFs {
-    pub fn new(root: OwnedFd) -> Self {
+    pub fn new(
+        root: OwnedFd,
+        mount_root: PathBuf,
+        redact: bool,
+        gate: Option<Arc<dyn DirAccess>>,
+    ) -> Self {
         Self {
             root,
+            mount_root,
+            redact,
+            gate,
             inodes: Mutex::new(InodeTable::new()),
             handles: Mutex::new(Handles::new()),
         }
@@ -172,6 +212,16 @@ impl OverlayFs {
 
     fn root_fd(&self) -> BorrowedFd<'_> {
         self.root.as_fd()
+    }
+
+    /// Whether the access gate permits `access` to `rel` (relative to the mount
+    /// root). No gate ⇒ always allowed. The gate is consulted with the absolute
+    /// path so decisions are consistent across multiple overlays.
+    fn gate_allows(&self, rel: &Path, access: Access) -> bool {
+        match &self.gate {
+            Some(gate) => gate.allow(&self.mount_root.join(rel), access),
+            None => true,
+        }
     }
 
     fn path_of(&self, ino: INodeNo) -> Option<PathBuf> {
@@ -192,21 +242,25 @@ impl OverlayFs {
 
     /// Decide the read view for a regular file from its real contents.
     fn view_for(&self, rel: &Path, file_name: &OsStr) -> nix::Result<View> {
+        // Redaction disabled ⇒ never inspect contents; serve the real file.
+        if !self.redact {
+            return Ok(View::Passthrough);
+        }
         let fd = self.open_real(rel, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty())?;
         let mut prefix = [0u8; 64];
         let n = pread(fd.as_fd(), &mut prefix, 0).unwrap_or(0);
-        match handlers::detect(file_name, &prefix[..n]) {
+        match redact::detect(file_name, &prefix[..n]) {
             None => Ok(View::Passthrough),
             Some(HandlerKind::Env) => {
                 let original = read_all(fd.as_fd())?;
-                Ok(match handlers::redact_env(&original) {
+                Ok(match redact::redact_env(&original) {
                     Ok(bytes) => View::Env(bytes),
                     Err(_) => View::Failed,
                 })
             }
             Some(HandlerKind::PrivateKey) => {
                 let original = read_all(fd.as_fd())?;
-                Ok(match handlers::redact_private_key(&original) {
+                Ok(match redact::redact_private_key(&original) {
                     Some(bytes) => View::Key(bytes),
                     None => View::Passthrough,
                 })
@@ -250,8 +304,8 @@ impl OverlayFs {
         };
         let original = read_all(fd.as_fd()).map_err(errno)?;
         // Parse/merge BEFORE touching the original — never corrupt on error.
-        let merged = handlers::merge_env(&original, &written).map_err(|_| Errno::EIO)?;
-        let view = handlers::redact_env(&merged).map_err(|_| Errno::EIO)?;
+        let merged = redact::merge_env(&original, &written).map_err(|_| Errno::EIO)?;
+        let view = redact::redact_env(&merged).map_err(|_| Errno::EIO)?;
         ftruncate(fd.as_fd(), 0).map_err(errno)?;
         write_all_at(fd.as_fd(), &merged).map_err(errno)?;
         *served = view;
@@ -496,6 +550,17 @@ impl Filesystem for OverlayFs {
             reply.error(Errno::ENOENT);
             return;
         };
+        // Opening a file is gated (on the directory that contains it); the
+        // prompt distinguishes read from write.
+        let access = if flags.0 & (libc::O_WRONLY | libc::O_RDWR) != 0 {
+            Access::Write
+        } else {
+            Access::Read
+        };
+        if !self.gate_allows(&rel, access) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         let name = rel.file_name().unwrap_or_default().to_owned();
         let view = match self.view_for(&rel, &name) {
             Ok(v) => v,
@@ -554,7 +619,12 @@ impl Filesystem for OverlayFs {
             reply.error(Errno::ENOENT);
             return;
         };
+        // Creating a file is gated on the directory it would be created in.
         let rel = parent_path.join(name);
+        if !self.gate_allows(&rel, Access::Create) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         let mut oflag = OFlag::O_CREAT | OFlag::O_RDWR | OFlag::O_CLOEXEC;
         if flags & libc::O_TRUNC != 0 {
             oflag |= OFlag::O_TRUNC;
@@ -569,8 +639,9 @@ impl Filesystem for OverlayFs {
         };
         let ino = self.intern(rel.clone());
         // A freshly created file is empty; only `.env` files get a handler (a new
-        // key file has no header yet). Its redacted view starts empty too.
-        let handle = if handlers::is_env_file(name) {
+        // key file has no header yet). Its redacted view starts empty too. With
+        // redaction disabled it's a plain passthrough.
+        let handle = if self.redact && redact::is_env_file(name) {
             Handle::Env {
                 fd,
                 served: Vec::new(),

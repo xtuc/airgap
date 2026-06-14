@@ -52,6 +52,24 @@ airgap <program> [args...]
 environment, and the working directory unchanged. When `<program>` exits,
 `airgap` exits with the same code.
 
+By default `<program>` must be a program airgap has a profile for (matched by
+executable name):
+
+- **AI agents** — `opencode`, `claude` — run with redaction only.
+- **Package managers** — `npm`, `npx`, `yarn`, `pnpm` — run with redaction
+  **plus** an interactive file gate: because their install hooks run arbitrary
+  third-party code, airgap asks you to allow or reject the first read of each new
+  file (so a `postinstall` script reading `~/.ssh/id_rsa` is caught). Approving a
+  file grants only that file; decisions last for the run. A few benign paths are
+  pre-approved (`~/.npm/_logs`, `~/.npm/_cacache`, `~/.gitconfig`,
+  `$CWD/node_modules`, `$CWD/package.json`, `$CWD/package-lock.json`).
+
+Running anything else requires the `--allow-unknown-program` opt-out (run it with
+redaction only). `--profile <agent|npm>` forces a specific profile onto any
+program. `--debug` logs each file access the gate pre-allows (allowlist hits) to
+stderr. Program matching is a guardrail against accidental misuse, not a security
+boundary.
+
 ### Demo
 
 Compare `.env`'s content with and without using `airgap`:

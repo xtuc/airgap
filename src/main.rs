@@ -8,7 +8,8 @@
 //! on access, including files created after launch.
 
 mod fs;
-mod handlers;
+mod profiles;
+mod redact;
 
 use std::ffi::OsString;
 use std::os::unix::process::ExitStatusExt;
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
+use clap::Parser;
 use fuser::{Config, MountOption};
 use nix::errno::Errno;
 use nix::fcntl::{open, OFlag};
@@ -24,21 +26,85 @@ use nix::sched::{unshare, CloneFlags};
 use nix::sys::stat::Mode;
 
 use crate::fs::OverlayFs;
+use crate::profiles::Profile;
+
+/// airgap's command line. The leading flags configure airgap; `program` and
+/// everything after it is the wrapped command, passed through verbatim — so
+/// `airgap claude --help` runs `claude --help` (the `--help` is the child's).
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Run a program with secrets redacted, and (for package managers) file access gated"
+)]
+struct Cli {
+    /// Run a program airgap doesn't recognize, with redaction only and no gate.
+    #[arg(long)]
+    allow_unknown_program: bool,
+
+    /// Force a profile regardless of the program: `agent` or `npm`.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+
+    /// Log each file access the gate pre-allows (allowlist hits) to stderr.
+    #[arg(long)]
+    debug: bool,
+
+    /// The program to run, followed by its arguments.
+    //
+    // One trailing list (rather than a separate program + args positional) so
+    // `trailing_var_arg` stops option parsing at the program: everything after it
+    // is the child's, verbatim, including flags (`airgap claude --help` runs
+    // `claude --help`). A mistyped airgap flag *before* the program is still
+    // rejected, and `airgap -- --weird` allows a program whose name starts `-`.
+    #[arg(
+        trailing_var_arg = true,
+        required = true,
+        value_name = "PROGRAM [ARGS...]"
+    )]
+    command: Vec<OsString>,
+}
 
 fn main() {
-    // argv[0] is our own name; the rest is `<program> [args...]`.
-    let mut args = std::env::args_os();
-    let _self = args.next();
-    let program = match args.next() {
-        Some(p) => p,
-        None => {
-            eprintln!("usage: airgap <program> [args...]");
-            std::process::exit(2);
+    let cli = Cli::parse();
+    // `required = true` guarantees at least the program is present.
+    let (program, program_args) = cli
+        .command
+        .split_first()
+        .expect("clap requires a program");
+
+    // Select the program's profile (which also serves as the allowlist) *before*
+    // any privileged setup, so a refusal is fast and works without CAP_SYS_ADMIN.
+    // An explicit `--profile` overrides name-based resolution (and the allowlist).
+    let profile = if let Some(name) = &cli.profile {
+        match profiles::by_name(name) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "airgap: unknown profile '{name}' (expected one of: {})",
+                    profiles::names().join(", ")
+                );
+                std::process::exit(2);
+            }
+        }
+    } else {
+        match profiles::resolve(program) {
+            Some(p) => p,
+            None if cli.allow_unknown_program => profiles::unrestricted(),
+            None => {
+                let name = profiles::program_basename(program).to_string_lossy();
+                eprintln!(
+                    "airgap: refusing to run '{name}': not a recognized program ({}).\n  \
+                     airgap applies a per-program profile; to run something without one, \
+                     pass --allow-unknown-program:\n\n      \
+                     airgap --allow-unknown-program {name} [args...]",
+                    profiles::permitted_programs().join(", ")
+                );
+                std::process::exit(1);
+            }
         }
     };
-    let program_args: Vec<OsString> = args.collect();
 
-    match run(&program, &program_args) {
+    match run(program, program_args, profile.as_ref(), cli.debug) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("airgap: {e:#}");
@@ -47,9 +113,16 @@ fn main() {
     }
 }
 
-/// Set up the namespace and FUSE overlay, run the child, tear down, and return
-/// the child's exit code.
-fn run(program: &OsString, program_args: &[OsString]) -> Result<i32> {
+/// Set up the namespace and FUSE overlays, run the child, tear down, and return
+/// the child's exit code. The `profile` decides redaction and whether a directory
+/// gate is attached (one shared instance consulted by every overlay). `debug`
+/// makes the gate log the accesses it pre-allows.
+fn run(
+    program: &OsString,
+    program_args: &[OsString],
+    profile: &dyn Profile,
+    debug: bool,
+) -> Result<i32> {
     // New mount namespace, then make the tree private so our overlay doesn't
     // propagate back to the host's namespace. EPERM here means we lack
     // CAP_SYS_ADMIN, so turn it into an actionable message.
@@ -72,6 +145,12 @@ fn run(program: &OsString, program_args: &[OsString]) -> Result<i32> {
     let cwd = std::env::current_dir().context("getting current dir")?;
     let targets = overlay_targets(&cwd);
 
+    // Translate the declarative profile into runtime policy: redaction, and a
+    // single directory gate shared across all overlays (so a directory is
+    // decided once regardless of which overlay serves it).
+    let redact = profile.redaction();
+    let gate = profile.directory_gate(program, debug);
+
     let mut config = Config::default();
     config.mount_options = vec![MountOption::FSName("airgap".into())];
 
@@ -89,7 +168,8 @@ fn run(program: &OsString, program_args: &[OsString]) -> Result<i32> {
             Mode::empty(),
         )
         .with_context(|| format!("opening {}", dir.display()))?;
-        let session = fuser::spawn_mount2(OverlayFs::new(root), dir, &config)
+        let overlay = OverlayFs::new(root, dir.clone(), redact, gate.clone());
+        let session = fuser::spawn_mount2(overlay, dir, &config)
             .with_context(|| format!("mounting overlay at {}", dir.display()))?;
         sessions.push(session);
     }
@@ -114,12 +194,10 @@ fn run(program: &OsString, program_args: &[OsString]) -> Result<i32> {
 /// nested directories collapse to their outermost ancestor.
 fn overlay_targets(cwd: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![cwd.to_path_buf()];
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            if let Ok(home) = std::fs::canonicalize(&home) {
-                candidates.push(home);
-            }
-        }
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty())
+        && let Ok(home) = std::fs::canonicalize(&home)
+    {
+        candidates.push(home);
     }
     dedup_targets(candidates)
 }
@@ -219,5 +297,79 @@ mod tests {
             dedup_targets(paths(&["/home/sven", "/home/sven2"])),
             paths(&["/home/sven", "/home/sven2"])
         );
+    }
+
+    // --- argument parsing (clap) -------------------------------------------
+
+    /// Parse as if from `argv` (clap expects argv[0] to be the binary name).
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("airgap").chain(args.iter().copied()))
+    }
+
+    fn osvec(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parses_program_and_args() {
+        let cli = parse(&["claude", "--model", "opus"]).unwrap();
+        assert!(!cli.allow_unknown_program);
+        assert_eq!(cli.command, osvec(&["claude", "--model", "opus"]));
+    }
+
+    #[test]
+    fn parses_allow_unknown_flag() {
+        let cli = parse(&["--allow-unknown-program", "cat", ".env"]).unwrap();
+        assert!(cli.allow_unknown_program);
+        assert_eq!(cli.command, osvec(&["cat", ".env"]));
+    }
+
+    #[test]
+    fn parses_profile_override() {
+        let cli = parse(&["--profile", "npm", "cat", "x"]).unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("npm"));
+        assert_eq!(cli.command, osvec(&["cat", "x"]));
+    }
+
+    #[test]
+    fn profile_without_value_is_an_error() {
+        assert!(parse(&["--profile"]).is_err());
+    }
+
+    #[test]
+    fn parses_debug_flag() {
+        let cli = parse(&["--debug", "npm", "install"]).unwrap();
+        assert!(cli.debug);
+        assert_eq!(cli.command, osvec(&["npm", "install"]));
+        // Off by default.
+        assert!(!parse(&["npm"]).unwrap().debug);
+    }
+
+    #[test]
+    fn flags_after_program_belong_to_the_child() {
+        // `--allow-unknown-program` after the program is the child's arg, not ours.
+        let cli = parse(&["claude", "--allow-unknown-program"]).unwrap();
+        assert!(!cli.allow_unknown_program);
+        assert_eq!(cli.command, osvec(&["claude", "--allow-unknown-program"]));
+    }
+
+    #[test]
+    fn double_dash_ends_flag_parsing() {
+        // `--` lets a program whose name starts with `-` be specified.
+        let cli = parse(&["--", "--weird-name", "arg"]).unwrap();
+        assert!(!cli.allow_unknown_program);
+        assert_eq!(cli.command, osvec(&["--weird-name", "arg"]));
+    }
+
+    #[test]
+    fn missing_program_is_a_usage_error() {
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--allow-unknown-program"]).is_err());
+        assert!(parse(&["--"]).is_err());
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected() {
+        assert!(parse(&["--nope", "claude"]).is_err());
     }
 }

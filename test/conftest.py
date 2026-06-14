@@ -18,18 +18,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-
-def _find_binary():
-    candidate = REPO_ROOT / "target" / "debug" / "airgap"
-    return candidate if candidate.exists() else None
+# The integration tests always exercise the debug build at this path.
+AIRGAP_BIN = REPO_ROOT / "target" / "debug" / "airgap"
 
 
 @pytest.fixture(scope="session")
 def airgap_bin():
-    binary = _find_binary()
-    if binary is None:
-        pytest.skip("airgap binary not built — run `cargo build`")
-    return binary
+    return AIRGAP_BIN
 
 
 @pytest.fixture(scope="session")
@@ -37,8 +32,15 @@ def airgap_ready(airgap_bin, tmp_path_factory):
     """Skip the suite unless airgap can actually set up its namespace + mount."""
     probe = tmp_path_factory.mktemp("airgap_probe")
     marker = "__airgap_ready__"
+    # `echo` isn't a recognized program, so the probe opts out of the profile
+    # check to test only namespace/mount readiness.
     proc = subprocess.run(
-        [str(airgap_bin), shutil.which("echo") or "/bin/echo", marker],
+        [
+            str(airgap_bin),
+            "--allow-unknown-program",
+            shutil.which("echo") or "/bin/echo",
+            marker,
+        ],
         cwd=probe,
         capture_output=True,
         text=True,
@@ -68,12 +70,19 @@ def airgap(airgap_ready, workdir):
     HOME is pinned to the workdir so the home overlay targets the fixture dir
     (which equals cwd, collapsing to a single mount) rather than the real home
     of whoever runs the suite — keeping tests hermetic and fast.
+
+    The test programs (`cat`, `sh`, `python3`, ...) aren't recognized programs,
+    so `--allow-unknown-program` is passed by default to run them ungated. Pass
+    `airgap_flags=[...]` to use different leading airgap flags (e.g.
+    `["--profile", "npm"]` to exercise the directory gate). Extra subprocess
+    kwargs (e.g. `start_new_session=True`) are forwarded to `subprocess.run`.
     """
 
     def _run(*args, **kwargs):
+        flags = kwargs.pop("airgap_flags", ["--allow-unknown-program"])
         env = {**os.environ, "HOME": str(workdir), **kwargs.pop("env", {})}
         return subprocess.run(
-            [str(airgap_ready), *args],
+            [str(airgap_ready), *flags, *args],
             cwd=workdir,
             capture_output=True,
             text=True,

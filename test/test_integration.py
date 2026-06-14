@@ -7,6 +7,7 @@ Program names are passed bare (`cat`, `sh`, `python3`, ...); airgap resolves the
 against PATH, so we don't hard-code absolute paths.
 """
 
+import subprocess
 import textwrap
 
 import pytest
@@ -38,6 +39,89 @@ def expected_key_redaction(original_text):
     verbatim, everything between collapsed to a single placeholder line."""
     lines = original_text.splitlines()
     return f"{lines[0]}\n{PLACEHOLDER}\n{lines[-1]}\n"
+
+
+# --- child-program allowlist -----------------------------------------------
+
+# The allowlist check runs *before* any privileged namespace setup, so these
+# work whether or not airgap has CAP_SYS_ADMIN; they drive the binary directly
+# rather than through the `airgap` fixture (which always passes the opt-out).
+
+
+def _raw_run(airgap_bin, *args, cwd):
+    return subprocess.run(
+        [str(airgap_bin), *args], cwd=cwd, capture_output=True, text=True
+    )
+
+
+def test_unknown_program_is_rejected(airgap_bin, tmp_path):
+    result = _raw_run(airgap_bin, "cat", "/etc/hostname", cwd=tmp_path)
+    assert result.returncode == 1
+    assert "refusing to run" in result.stderr.lower()
+    # Pre-flight refusal: the program never ran, so it produced no output.
+    assert result.stdout == ""
+
+
+def test_allow_unknown_program_bypasses_check(airgap_bin, tmp_path):
+    # With the opt-out the recognition check no longer fires. (It may still fail
+    # later for lack of CAP_SYS_ADMIN, but never with the "refusing to run"
+    # refusal.)
+    result = _raw_run(airgap_bin, "--allow-unknown-program", "true", cwd=tmp_path)
+    assert "refusing to run" not in result.stderr.lower()
+
+
+# --- npm profile: the file-access gate -------------------------------------
+
+
+def test_npm_profile_denies_unapproved_file_without_tty(airgap):
+    # `--profile npm` forces the package-manager file gate onto any program (here
+    # `cat`). With no controlling terminal (start_new_session=True), the gate
+    # cannot prompt for a non-pre-approved file and fails closed: the read is
+    # denied with EACCES, so cat can't read it at all (let alone the real secret).
+    result = airgap(
+        "cat",
+        ".env",
+        airgap_flags=["--profile", "npm"],
+        start_new_session=True,
+    )
+    assert result.returncode != 0
+    assert "permission denied" in result.stderr.lower()
+    assert PLACEHOLDER not in result.stdout
+    assert "s3cr3t_pw" not in result.stdout
+
+
+def test_npm_profile_allows_preapproved_path_without_prompting(airgap):
+    # A pre-approved path ($CWD/package.json) is allowed without ever prompting,
+    # so the read succeeds even with no controlling terminal — proving the
+    # allowlist short-circuits the gate (a regression that dropped it would deny
+    # here, since there's no tty to approve through).
+    (airgap.workdir / "package.json").write_text('{"name":"demo"}\n')
+    result = airgap(
+        "cat",
+        "package.json",
+        airgap_flags=["--profile", "npm"],
+        start_new_session=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == '{"name":"demo"}\n'
+
+
+# --- agent profile: redaction, no gate -------------------------------------
+
+
+def test_agent_profile_redacts_without_gating(airgap):
+    # The agent profile has no file gate, so reads succeed with no controlling
+    # terminal (unlike the npm profile, which would deny) — and secrets are still
+    # redacted.
+    expected = expected_env_redaction((airgap.workdir / ".env").read_text())
+    result = airgap(
+        "cat",
+        ".env",
+        airgap_flags=["--profile", "agent"],
+        start_new_session=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
 
 
 # --- transparency / passthrough -------------------------------------------
