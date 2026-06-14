@@ -72,6 +72,21 @@ def test_env_read_is_exactly_redacted(airgap, path):
     assert result.stdout == expected
 
 
+# --- the home directory gets its own overlay -------------------------------
+
+
+def test_home_outside_cwd_is_redacted(airgap, tmp_path_factory):
+    # A $HOME disjoint from the working directory is mounted as a second overlay,
+    # so secrets there are redacted just like those under cwd.
+    home = tmp_path_factory.mktemp("fakehome")
+    secret = home / ".env"
+    secret.write_text("SECRET=topsecret\nTOKEN=abc123\n")
+
+    result = airgap("cat", str(secret), env={"HOME": str(home)})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected_env_redaction(secret.read_text())
+
+
 # --- redaction is inherited by deeply nested children ----------------------
 
 # A program that re-execs itself `depth` times before reading .env, to prove the

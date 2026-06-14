@@ -12,6 +12,7 @@ mod handlers;
 
 use std::ffi::OsString;
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
@@ -65,35 +66,79 @@ fn run(program: &OsString, program_args: &[OsString]) -> Result<i32> {
     )
     .context("making mounts private")?;
 
-    // Capture a dir fd to the *real* working directory before mounting the
-    // overlay over it, so the backend reaches the real files (via `*at`)
-    // without recursing through FUSE. O_CLOEXEC so the child can't inherit it.
+    // The directories to protect: the working directory and the user's home.
+    // If one nests inside the other (typically cwd inside `$HOME`), only the
+    // outermost is kept — its overlay already redacts everything beneath it.
     let cwd = std::env::current_dir().context("getting current dir")?;
-    let root = open(
-        &cwd,
-        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(|| format!("opening working directory {}", cwd.display()))?;
+    let targets = overlay_targets(&cwd);
 
-    // Mount the FUSE overlay over the working directory, on a background
-    // thread. Every file the child accesses now flows through it.
     let mut config = Config::default();
     config.mount_options = vec![MountOption::FSName("airgap".into())];
-    let session = fuser::spawn_mount2(OverlayFs::new(root), &cwd, &config)
-        .with_context(|| format!("mounting overlay at {}", cwd.display()))?;
 
-    // Our cwd was opened before the mount, so it still points at the *underlying*
-    // directory; re-enter the path so it (and the child that inherits it) resolves
-    // through the overlay. Otherwise relative accesses would bypass redaction.
+    // Mount a FUSE overlay over each target. Each backend first captures an
+    // `O_PATH` fd to the *real* directory, before its overlay is mounted, so it
+    // reaches the real files (via `*at`) without recursing through FUSE; targets
+    // never nest, so one overlay's mount can't shadow another's fd. O_CLOEXEC so
+    // the child can't inherit the fds. Every file the child accesses under a
+    // target now flows through its overlay.
+    let mut sessions = Vec::new();
+    for dir in &targets {
+        let root = open(
+            dir,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("opening {}", dir.display()))?;
+        let session = fuser::spawn_mount2(OverlayFs::new(root), dir, &config)
+            .with_context(|| format!("mounting overlay at {}", dir.display()))?;
+        sessions.push(session);
+    }
+
+    // Our cwd was opened before the mounts, so it still points at the
+    // *underlying* directory; re-enter the path so it (and the child that
+    // inherits it) resolves through the overlay. Otherwise relative accesses
+    // would bypass redaction.
     std::env::set_current_dir(&cwd)
         .with_context(|| format!("re-entering working directory {}", cwd.display()))?;
 
-    // Run the child (inherits our namespace and cwd, so it sees the overlay),
+    // Run the child (inherits our namespace and cwd, so it sees the overlays),
     // then unmount regardless of how it went.
     let result = spawn_and_wait(program, program_args);
-    drop(session); // unmounts the overlay at `cwd`
+    drop(sessions); // unmounts every overlay
     result
+}
+
+/// The directories to overlay: the working directory and the user's home
+/// (`$HOME`). Home is resolved through symlinks and dropped if `$HOME` is unset,
+/// empty, or doesn't resolve. The result is de-duplicated by [`dedup_targets`] so
+/// nested directories collapse to their outermost ancestor.
+fn overlay_targets(cwd: &Path) -> Vec<PathBuf> {
+    let mut candidates = vec![cwd.to_path_buf()];
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            if let Ok(home) = std::fs::canonicalize(&home) {
+                candidates.push(home);
+            }
+        }
+    }
+    dedup_targets(candidates)
+}
+
+/// Reduce a list of directories to the minimal set whose overlays cover them
+/// all: drop any directory equal to or nested within another, keeping only the
+/// outermost ancestors. Order of the survivors follows first appearance.
+fn dedup_targets(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut targets: Vec<PathBuf> = Vec::new();
+    for dir in candidates {
+        // Already covered by a kept ancestor (or an exact duplicate)?
+        if targets.iter().any(|kept| dir.starts_with(kept)) {
+            continue;
+        }
+        // This dir supersedes any kept dirs nested within it.
+        targets.retain(|kept| !kept.starts_with(&dir));
+        targets.push(dir);
+    }
+    targets
 }
 
 /// Actionable message for the EPERM that `unshare`/`mount` return when the
@@ -121,4 +166,58 @@ fn spawn_and_wait(program: &OsString, program_args: &[OsString]) -> Result<i32> 
         Some(code) => code,
         None => 128 + status.signal().unwrap_or(0),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paths(items: &[&str]) -> Vec<PathBuf> {
+        items.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn keeps_disjoint_dirs() {
+        assert_eq!(
+            dedup_targets(paths(&["/tmp/work", "/home/sven"])),
+            paths(&["/tmp/work", "/home/sven"])
+        );
+    }
+
+    #[test]
+    fn drops_cwd_nested_in_home() {
+        // cwd inside $HOME: only $HOME survives, covering the cwd beneath it.
+        assert_eq!(
+            dedup_targets(paths(&["/home/sven/proj", "/home/sven"])),
+            paths(&["/home/sven"])
+        );
+    }
+
+    #[test]
+    fn drops_home_nested_in_cwd() {
+        // The outermost wins regardless of order.
+        assert_eq!(
+            dedup_targets(paths(&["/", "/home/sven"])),
+            paths(&["/"])
+        );
+    }
+
+    #[test]
+    fn collapses_exact_duplicate() {
+        // cwd == $HOME: a single overlay.
+        assert_eq!(
+            dedup_targets(paths(&["/home/sven", "/home/sven"])),
+            paths(&["/home/sven"])
+        );
+    }
+
+    #[test]
+    fn sibling_prefix_is_not_nesting() {
+        // `/home/sven2` is not under `/home/sven` despite the string prefix;
+        // path-component matching keeps them distinct.
+        assert_eq!(
+            dedup_targets(paths(&["/home/sven", "/home/sven2"])),
+            paths(&["/home/sven", "/home/sven2"])
+        );
+    }
 }

@@ -12,14 +12,18 @@ files, but it never sees the actual secrets.
 
 So far `airgap` protects:
 
-- **`.env`** — matched by filename. Values are redacted to `<redacted value>`
-  while keys stay visible; edits, additions, and deletions are persisted back to
-  the real file.
+- **`.env` and `.env.*`** (e.g. `.env.local`, `.env.production`) — matched by
+  filename. Values are redacted to `<redacted value>` while keys stay visible;
+  edits, additions, and deletions are persisted back to the real file.
 - **SSH / PGP private keys** — matched by content (any file starting with a
   private-key header: OpenSSH/ed25519, RSA, EC/PKCS#8, or PGP). The key body is
   redacted while the `BEGIN`/`END` markers are kept.
 
 More secret types will be added.
+
+These are redacted anywhere under the **working directory** or your **home
+directory** (`$HOME`) — so both a project's `.env` and `~/.ssh` keys are covered.
+Matching is dynamic: files created after launch are caught too.
 
 ## Install
 

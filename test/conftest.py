@@ -8,6 +8,7 @@ failing — grant it with:
     sudo setcap cap_sys_admin+ep <path-to-airgap>
 """
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -62,14 +63,21 @@ def workdir(tmp_path):
 
 @pytest.fixture
 def airgap(airgap_ready, workdir):
-    """Run airgap in the fixture workdir. Call as airgap('cat', '.env')."""
+    """Run airgap in the fixture workdir. Call as airgap('cat', '.env').
+
+    HOME is pinned to the workdir so the home overlay targets the fixture dir
+    (which equals cwd, collapsing to a single mount) rather than the real home
+    of whoever runs the suite — keeping tests hermetic and fast.
+    """
 
     def _run(*args, **kwargs):
+        env = {**os.environ, "HOME": str(workdir), **kwargs.pop("env", {})}
         return subprocess.run(
             [str(airgap_ready), *args],
             cwd=workdir,
             capture_output=True,
             text=True,
+            env=env,
             **kwargs,
         )
 
