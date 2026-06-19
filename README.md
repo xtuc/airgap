@@ -2,6 +2,9 @@
 
 Security for the modern AI age.
 
+> No security layer is perfect. airgap is still experimental. Contributions
+> welcome!
+
 ## Protected secrets
 
 `airgap` launches a target program (e.g. an AI coding agent) inside its own mount
@@ -133,3 +136,8 @@ scripts. Or alias it in your shell config:
 ```
 alias npm="airgap npm"
 ```
+
+## Security
+
+If you want to report a security concern or ask a question, email
+airgap@sauleau.com.
