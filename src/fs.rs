@@ -243,6 +243,39 @@ impl OverlayFs {
         fstatat(self.root_fd(), at(rel), AtFlags::AT_SYMLINK_NOFOLLOW)
     }
 
+    /// Does this symlink's target resolve to a path **within this overlay**?
+    ///
+    /// Such a link is redacted naturally when the kernel follows it through FUSE,
+    /// so the backend must *not* follow it itself: opening the link (which
+    /// `view_for` does) makes the kernel resolve the target — an absolute path
+    /// back under our own mount — re-entering this single-threaded backend, which
+    /// then waits on itself forever (e.g. `~/.local/bin/claude ->
+    /// ~/.local/share/claude/<ver>`). Only links whose target *escapes* the
+    /// overlay need inspecting here, since their target would otherwise be read
+    /// raw, bypassing redaction.
+    ///
+    /// Resolution is purely lexical: a real canonicalization would itself follow
+    /// the link back through the mount and deadlock. An unreadable link is
+    /// treated as escaping (left as a plain symlink, never followed for
+    /// redaction) — the safe default.
+    fn symlink_target_within_overlay(&self, rel: &Path) -> bool {
+        let Ok(target) = readlinkat(self.root_fd(), at(rel)) else {
+            return false;
+        };
+        let target = PathBuf::from(target);
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            // Relative to the directory that contains the link.
+            self.mount_root
+                .join(rel)
+                .parent()
+                .unwrap_or(&self.mount_root)
+                .join(target)
+        };
+        lexically_normalize(&resolved).starts_with(&self.mount_root)
+    }
+
     /// Decide the read view for a regular file from its real contents.
     fn view_for(&self, rel: &Path, file_name: &OsStr) -> nix::Result<View> {
         // Redaction disabled ⇒ never inspect contents; serve the real file.
@@ -288,20 +321,26 @@ impl OverlayFs {
         // applied to the link, not its target. Ordinary (non-secret) symlinks,
         // and links we can't resolve, are left as symlinks.
         if ftype == SFlag::S_IFLNK {
-            let redacted_len = match self.view_for(rel, name) {
-                Ok(View::Redacted(_, bytes)) | Ok(View::Key(bytes)) => Some(bytes.len()),
-                Ok(View::Failed) => Some(0),
-                Ok(View::Passthrough) | Err(_) => None,
-            };
-            if let Some(len) = redacted_len {
-                // Base attrs on the target (its perms/owner/times), then override
-                // kind and size for the redacted regular-file view.
-                let target = fstatat(self.root_fd(), at(rel), AtFlags::empty())?;
-                let mut attr = attr_from_stat(INodeNo(ino), &target);
-                attr.kind = FileType::RegularFile;
-                attr.size = len as u64;
-                attr.blocks = attr.size.div_ceil(512);
-                return Ok(attr);
+            // Only follow-and-inspect links whose target escapes this overlay.
+            // A link staying inside is redacted by the overlay itself when the
+            // kernel follows it, and following it here would re-enter our own
+            // mount and deadlock (see `symlink_target_within_overlay`).
+            if !self.symlink_target_within_overlay(rel) {
+                let redacted_len = match self.view_for(rel, name) {
+                    Ok(View::Redacted(_, bytes)) | Ok(View::Key(bytes)) => Some(bytes.len()),
+                    Ok(View::Failed) => Some(0),
+                    Ok(View::Passthrough) | Err(_) => None,
+                };
+                if let Some(len) = redacted_len {
+                    // Base attrs on the target (its perms/owner/times), then
+                    // override kind and size for the redacted regular-file view.
+                    let target = fstatat(self.root_fd(), at(rel), AtFlags::empty())?;
+                    let mut attr = attr_from_stat(INodeNo(ino), &target);
+                    attr.kind = FileType::RegularFile;
+                    attr.size = len as u64;
+                    attr.blocks = attr.size.div_ceil(512);
+                    return Ok(attr);
+                }
             }
             return Ok(attr_from_stat(INodeNo(ino), &st));
         }
@@ -343,6 +382,26 @@ impl OverlayFs {
         *served = view;
         Ok(())
     }
+}
+
+/// Resolve `.` and `..` components without touching the filesystem (a real
+/// canonicalization would follow symlinks back through the mount and deadlock).
+/// `..` pops the previous *normal* component and never climbs above the root.
+fn lexically_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if out.file_name().is_some() {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Read an entire fd from offset 0 via `pread`, without disturbing its offset.

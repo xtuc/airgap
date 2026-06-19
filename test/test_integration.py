@@ -326,6 +326,37 @@ def test_symlinked_env_outside_overlay_is_redacted(airgap, tmp_path_factory):
     assert result.stdout == 'API_KEY="<redacted value>"\n'
 
 
+def test_abs_symlink_inside_overlay_does_not_deadlock(airgap):
+    # A symlink whose target is an ABSOLUTE path back inside the overlay (the
+    # layout of `~/.local/bin/claude -> ~/.local/share/claude/<ver>`). The backend
+    # must NOT follow it itself — doing so re-routes the absolute target through
+    # its own mount and deadlocks. It should resolve through FUSE normally and
+    # serve the (non-secret) target. A regression here hangs the whole run.
+    target = airgap.workdir / "real_tool"
+    target.write_text("#!/bin/sh\necho ok\n")
+    link = airgap.workdir / "tool_link"
+    link.symlink_to(target)  # absolute target, inside the overlay
+
+    result = airgap("cat", "tool_link", timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "#!/bin/sh\necho ok\n"
+
+
+def test_symlink_to_secret_inside_overlay_is_redacted(airgap):
+    # The inside-overlay link is served as a plain symlink (not followed by the
+    # backend), but when its target is itself a secret the overlay still redacts
+    # it as the kernel follows the link through FUSE — so no raw secret leaks.
+    target = airgap.workdir / ".env.nested"  # `.env.<suffix>` name → redacted
+    target.write_text("API_KEY=inside-secret\n")
+    link = airgap.workdir / "env_link"
+    link.symlink_to(target)  # absolute target, inside the overlay
+
+    result = airgap("cat", "env_link", timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert "inside-secret" not in result.stdout
+    assert result.stdout == 'API_KEY="<redacted value>"\n'
+
+
 # --- the home directory gets its own overlay -------------------------------
 
 

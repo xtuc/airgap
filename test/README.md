@@ -21,9 +21,11 @@ python3 -m venv .venv
 
 ```
 cargo build --release
-sudo setcap cap_sys_admin+ep ./target/release/airgap   # needed once per build
 .venv/bin/pytest test/
 ```
 
-Without a built binary, or without `CAP_SYS_ADMIN` on it, the suite **skips**
-itself with an explanatory message instead of failing.
+`airgap` sets up its namespace from an unprivileged user namespace, so the suite
+runs as a normal user with no extra setup. If the binary isn't built, or the
+kernel disables unprivileged user namespaces (and the binary has no
+`CAP_SYS_ADMIN`), the suite **skips** itself with an explanatory message instead
+of failing.
