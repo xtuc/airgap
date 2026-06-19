@@ -275,11 +275,39 @@ impl OverlayFs {
     /// have a handler overridden to the redacted (served) length.
     fn attr(&self, ino: u64, rel: &Path) -> nix::Result<FileAttr> {
         let st = self.stat(rel)?;
+        let name = rel.file_name().unwrap_or_default();
+        let ftype = SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT;
+
+        // A symlink whose target is a secret must NOT be presented as a symlink:
+        // the kernel would resolve it to the target — possibly outside this
+        // overlay (e.g. `~/.npmrc -> /opt/dotfiles/.npmrc`) — and read it raw,
+        // bypassing redaction entirely. So follow it ourselves (`view_for` opens
+        // through the link) and, if it resolves to a secret, present a redacted
+        // *regular file*: the kernel then issues FUSE read()/write() against this
+        // node instead of chasing the link out of the mount. The policy is thus
+        // applied to the link, not its target. Ordinary (non-secret) symlinks,
+        // and links we can't resolve, are left as symlinks.
+        if ftype == SFlag::S_IFLNK {
+            let redacted_len = match self.view_for(rel, name) {
+                Ok(View::Redacted(_, bytes)) | Ok(View::Key(bytes)) => Some(bytes.len()),
+                Ok(View::Failed) => Some(0),
+                Ok(View::Passthrough) | Err(_) => None,
+            };
+            if let Some(len) = redacted_len {
+                // Base attrs on the target (its perms/owner/times), then override
+                // kind and size for the redacted regular-file view.
+                let target = fstatat(self.root_fd(), at(rel), AtFlags::empty())?;
+                let mut attr = attr_from_stat(INodeNo(ino), &target);
+                attr.kind = FileType::RegularFile;
+                attr.size = len as u64;
+                attr.blocks = attr.size.div_ceil(512);
+                return Ok(attr);
+            }
+            return Ok(attr_from_stat(INodeNo(ino), &st));
+        }
+
         let mut attr = attr_from_stat(INodeNo(ino), &st);
-        let is_regular =
-            SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFREG;
-        if is_regular {
-            let name = rel.file_name().unwrap_or_default();
+        if ftype == SFlag::S_IFREG {
             match self.view_for(rel, name)? {
                 View::Passthrough => {}
                 View::Redacted(_, bytes) | View::Key(bytes) => {

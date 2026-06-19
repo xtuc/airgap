@@ -196,6 +196,119 @@ def test_env_read_is_exactly_redacted(airgap, path):
     assert result.stdout == expected
 
 
+# --- .npmrc redaction on read ----------------------------------------------
+
+
+def test_npmrc_read_is_exactly_redacted(airgap):
+    # The credential values are replaced by the placeholder; registries, scopes,
+    # email, and comments survive verbatim.
+    original = (airgap.workdir / ".npmrc").read_text()
+    result = airgap("cat", ".npmrc")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected_npmrc_redaction(original)
+
+
+def test_npmrc_secret_values_never_leak(airgap):
+    # No fake credential from the fixture appears in the redacted view, while the
+    # public config the child legitimately needs stays readable.
+    result = airgap("cat", ".npmrc")
+    assert result.returncode == 0, result.stderr
+    for secret in (
+        "npm_fake0123456789abcdefghijKLMNOPqrstuv",  # npmjs _authToken
+        "ghp_fakeGITHUBpackagestokenABCDEF123456",  # github pkg _authToken
+        "czNjcjN0X3B3",  # _password (base64)
+        "dXNlcjpzM2NyM3RfcHc=",  # _auth (base64)
+    ):
+        assert secret not in result.stdout
+    for visible in (
+        "registry=https://registry.npmjs.org/",
+        "@acme:registry=https://npm.pkg.github.com/",
+        "email=dev@example.com",
+        "always-auth=true",
+    ):
+        assert visible in result.stdout
+
+
+def test_npmrc_nonsecret_edit_persists_and_token_restored(airgap):
+    # The child (seeing redacted tokens) edits a non-secret line and writes the
+    # file back. The edit persists, and the tokens it never saw are restored to
+    # their real values — not left as the placeholder.
+    script = textwrap.dedent(
+        """
+        lines = open('.npmrc').read().splitlines()
+        out = ['registry=https://example.com/' if l.startswith('registry=') else l
+               for l in lines]
+        open('.npmrc', 'w').write('\\n'.join(out) + '\\n')
+        """
+    )
+    result = airgap("python3", "-c", script)
+    assert result.returncode == 0, result.stderr
+
+    persisted = parse_npmrc((airgap.workdir / ".npmrc").read_text())
+    assert persisted["registry"] == "https://example.com/"
+    assert (
+        persisted["//registry.npmjs.org/:_authToken"]
+        == "npm_fake0123456789abcdefghijKLMNOPqrstuv"
+    )
+    assert PLACEHOLDER not in (airgap.workdir / ".npmrc").read_text()
+
+
+def test_npmrc_token_edit_persists(airgap):
+    # A deliberate change to a token value is written through verbatim.
+    script = textwrap.dedent(
+        """
+        key = '//registry.npmjs.org/:_authToken='
+        lines = open('.npmrc').read().splitlines()
+        out = [key + 'npm_rotated' if l.startswith(key) else l for l in lines]
+        open('.npmrc', 'w').write('\\n'.join(out) + '\\n')
+        """
+    )
+    result = airgap("python3", "-c", script)
+    assert result.returncode == 0, result.stderr
+
+    persisted = parse_npmrc((airgap.workdir / ".npmrc").read_text())
+    assert persisted["//registry.npmjs.org/:_authToken"] == "npm_rotated"
+
+
+# --- symlinked secrets cannot bypass the overlay ---------------------------
+
+
+def test_symlinked_secret_outside_overlay_is_redacted(airgap, tmp_path_factory):
+    # A secret living OUTSIDE any overlay, reached via a symlink INSIDE it, must
+    # still be redacted: otherwise the kernel would follow the link to the raw
+    # target and leak it. airgap presents the link as a redacted regular file.
+    outside = tmp_path_factory.mktemp("dotfiles")
+    real = outside / ".npmrc"
+    real.write_text(
+        "registry=https://registry.npmjs.org/\n"
+        "//registry.npmjs.org/:_authToken=npm_SYMLINK_SECRET\n"
+    )
+    link = airgap.workdir / ".npmrc"
+    link.unlink()  # replace the fixture file with a symlink to the outside secret
+    link.symlink_to(real)
+
+    result = airgap("cat", ".npmrc")
+    assert result.returncode == 0, result.stderr
+    assert "npm_SYMLINK_SECRET" not in result.stdout
+    assert "//registry.npmjs.org/:_authToken=<redacted value>" in result.stdout
+    # The non-secret line is still served.
+    assert "registry=https://registry.npmjs.org/" in result.stdout
+
+
+def test_symlinked_env_outside_overlay_is_redacted(airgap, tmp_path_factory):
+    # Same bypass, for a .env symlinked out of the overlay.
+    outside = tmp_path_factory.mktemp("envdir")
+    real = outside / ".env"
+    real.write_text("API_KEY=leakme-via-symlink\n")
+    link = airgap.workdir / ".env.linked"  # `.env.<suffix>` matches the handler
+    link.symlink_to(real)
+
+    result = airgap("cat", ".env.linked")
+    assert result.returncode == 0, result.stderr
+    assert "leakme-via-symlink" not in result.stdout
+    assert result.stdout == 'API_KEY="<redacted value>"\n'
+
+
 # --- the home directory gets its own overlay -------------------------------
 
 
