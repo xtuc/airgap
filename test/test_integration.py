@@ -1,7 +1,8 @@
 """End-to-end tests for airgap: run a program under it and observe the redacted view.
 
-All tests are skipped automatically unless the airgap binary is built and has
-CAP_SYS_ADMIN (see conftest.py).
+All tests are skipped automatically unless the airgap binary is built and can
+set up its namespace (via an unprivileged user namespace, or CAP_SYS_ADMIN; see
+conftest.py).
 
 Program names are passed bare (`cat`, `sh`, `python3`, ...); airgap resolves them
 against PATH, so we don't hard-code absolute paths.
@@ -83,9 +84,9 @@ def expected_npmrc_redaction(original_text):
 
 # --- child-program allowlist -----------------------------------------------
 
-# The allowlist check runs *before* any privileged namespace setup, so these
-# work whether or not airgap has CAP_SYS_ADMIN; they drive the binary directly
-# rather than through the `airgap` fixture (which always passes the opt-out).
+# The allowlist check runs *before* any namespace setup, so these work whether
+# or not airgap can create its namespace; they drive the binary directly rather
+# than through the `airgap` fixture (which always passes the opt-out).
 
 
 def _raw_run(airgap_bin, *args, cwd):
@@ -104,8 +105,8 @@ def test_unknown_program_is_rejected(airgap_bin, tmp_path):
 
 def test_allow_unknown_program_bypasses_check(airgap_bin, tmp_path):
     # With the opt-out the recognition check no longer fires. (It may still fail
-    # later for lack of CAP_SYS_ADMIN, but never with the "refusing to run"
-    # refusal.)
+    # later if the namespace can't be set up, but never with the "refusing to
+    # run" refusal.)
     result = _raw_run(airgap_bin, "--allow-unknown-program", "true", cwd=tmp_path)
     assert "refusing to run" not in result.stderr.lower()
 

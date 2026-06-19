@@ -1,9 +1,10 @@
 """Shared fixtures for airgap integration tests.
 
-These tests run the real `airgap` binary, which needs CAP_SYS_ADMIN to create a
-mount namespace and mount FUSE. If the binary isn't built or doesn't have the
-capability, the whole suite is skipped with an explanatory message rather than
-failing — grant it with:
+These tests run the real `airgap` binary, which needs a mount namespace + FUSE.
+airgap gets these from an unprivileged user namespace, so no setup is normally
+required. If the kernel forbids unprivileged user namespaces *and* the binary
+lacks CAP_SYS_ADMIN, the whole suite is skipped with an explanatory message
+rather than failing — enable user namespaces, or grant the capability with:
 
     sudo setcap cap_sys_admin+ep <path-to-airgap>
 """
@@ -47,8 +48,9 @@ def airgap_ready(airgap_bin, tmp_path_factory):
     )
     if proc.returncode != 0 or marker not in proc.stdout:
         pytest.skip(
-            "airgap is not runnable — it needs CAP_SYS_ADMIN and a working build.\n"
-            f"  grant it: sudo setcap cap_sys_admin+ep {airgap_bin}\n"
+            "airgap is not runnable — it needs a working build plus either "
+            "unprivileged user namespaces or CAP_SYS_ADMIN.\n"
+            f"  grant the cap: sudo setcap cap_sys_admin+ep {airgap_bin}\n"
             f"  exit={proc.returncode} stderr={proc.stderr.strip()!r}"
         )
     return airgap_bin

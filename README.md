@@ -95,17 +95,6 @@ Answer `n` to reject the access.
 cargo install airgap
 ```
 
-`airgap` creates a mount namespace and mounts a FUSE filesystem, which require
-`CAP_SYS_ADMIN`. Grant it to the installed binary once so you can run it as a
-normal user (no `sudo` per invocation):
-
-```
-sudo setcap cap_sys_admin+ep "$(command -v airgap)"
-```
-
-Note: the capability is an attribute of the file, so it is lost whenever the
-binary is reinstalled. Re-run `setcap` after each `cargo install`.
-
 ## Usage
 
 ```

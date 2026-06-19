@@ -9,7 +9,7 @@ repository = "https://github.com/xtuc/airgap"
 
 [dependencies]
 fuser = "0.17"
-nix = { version = "0.31", features = ["mount", "sched", "process", "signal", "fs", "uio", "dir"] }
+nix = { version = "0.31", features = ["mount", "sched", "process", "signal", "fs", "uio", "dir", "user"] }
 dotenvy = "0.15"
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }

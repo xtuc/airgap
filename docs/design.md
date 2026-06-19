@@ -80,7 +80,8 @@ There is no discovery walk and no "skipping override: No such file" noise.
 airgap (parent)
 │
 ├─ resolve program profile        # reject unknown programs; pick gate (pre-flight)
-├─ unshare(CLONE_NEWNS)           # new mount namespace
+├─ unshare(CLONE_NEWUSER|NEWNS)   # user namespace (for privilege) + mount namespace
+├─ write uid_map / gid_map        # identity-map self into the user namespace
 ├─ make mounts private            # so our mounts don't leak to the host
 ├─ compute target roots           # {cwd, $HOME}, de-duplicated (see below)
 │
@@ -260,9 +261,11 @@ consistency across them.
 
 ### Mount namespace
 
-Before mounting anything, `airgap` unshares the mount namespace with
-`unshare(2)` and the `CLONE_NEWNS` flag (via the [`nix`](https://crates.io/crates/nix)
-crate). This requires `CAP_SYS_ADMIN` (see [Privileges](#privileges)).
+Before mounting anything, `airgap` unshares a new mount namespace with
+`unshare(2)` (via the [`nix`](https://crates.io/crates/nix) crate). It does this
+together with a new **user namespace** (`CLONE_NEWUSER | CLONE_NEWNS`), which is
+where it gets the privilege to do so without `sudo` or `setcap` (see
+[Privileges](#privileges)).
 
 After unsharing, the root mount is remounted as private
 (`mount(MS_REC | MS_PRIVATE)`) so that the overlay mounted in this namespace does
@@ -283,54 +286,64 @@ The mount-namespace and mount steps need `CAP_SYS_ADMIN`. Specifically:
 | Mount a FUSE overlay over each target root | `CAP_SYS_ADMIN`, or the setuid `fusermount3` helper |
 | `fork`/`exec` the child | none |
 
-There are two ways to obtain that capability.
+There are two ways to obtain that capability. `airgap` uses **Approach A** by
+default, falling back to **Approach B** only if Approach A is unavailable — so it
+runs as a normal user with no setup, while still working on locked-down kernels.
 
-#### Approach A — capability on the binary (current default)
+#### Approach A — unprivileged user namespace (default)
 
-Grant the binary `CAP_SYS_ADMIN` once, then run it as a normal user:
-
-```
-sudo setcap cap_sys_admin+ep "$(command -v airgap)"
-airgap <program> [args...]
-```
-
-`+ep` makes the capability **e**ffective and **p**ermitted whenever the binary
-runs, so no `sudo` is needed per invocation. This is the approach we use for now.
-(Re-run `setcap` after each `cargo install`, since the capability is an attribute
-of the file and is lost when the binary is replaced.)
-
-If the capability is missing, `airgap` does not fail with a bare `EPERM` partway
-through setup: it maps the `EPERM` from `unshare(CLONE_NEWNS)` to an actionable
-message naming the exact `setcap` command for the running binary, then exits.
-
-#### Approach B — unprivileged user namespace
-
-Alternatively, create a user namespace first. An ordinary user can do this
-(where distro policy allows — `kernel.unprivileged_userns_clone=1`, the default
-on most modern distros), and inside it holds `CAP_SYS_ADMIN` over its own
-namespaces — enough for the private remount and the mounts, with zero real
-privileges.
+`airgap` creates a user namespace first. An ordinary user can do this (where
+distro policy allows — the default on most modern distros), and inside it holds a
+full capability set, including `CAP_SYS_ADMIN` over its own namespaces — enough
+for the private remount and the FUSE mounts, with zero real privileges. No
+`sudo`, no `setcap`. The mount namespace is created in the same `unshare` and is
+owned by the new user namespace.
 
 The catch is identity: a fresh user namespace starts with no uid/gid mapping, so
-the process would appear as `nobody`. We map the calling user back to itself.
-The unprivileged rules allow writing **one line** to the map files covering
-**only your own host uid** — which is exactly an identity map — without any
-setuid helper:
+the process would appear as `nobody` (the overflow id, 65534). We map the calling
+user back to itself — an **identity** map — so the child keeps its real uid/gid
+and accesses to the real files behind the overlay still resolve as that user. The
+unprivileged rules allow writing **one line** to the map files covering **only
+your own host uid**, which is exactly that, without any setuid helper:
 
 ```
+uid = getuid(); gid = getgid()          # captured BEFORE unshare (see gotcha)
 unshare(CLONE_NEWUSER | CLONE_NEWNS)
-write /proc/self/uid_map      "1000 1000 1"   # host uid 1000 → 1000 inside
 write /proc/self/setgroups    "deny"          # required before gid_map
+write /proc/self/uid_map      "1000 1000 1"   # host uid 1000 → 1000 inside
 write /proc/self/gid_map      "1000 1000 1"
 # now hold CAP_SYS_ADMIN inside → private remount + mounts
 fork/exec child
 ```
 
-Two gotchas: `gid_map` is rejected unless `setgroups` is set to `"deny"` first,
-and the maps must be written before the mapped process relies on the new
-identity. Mapping a *range* of uids or some *other* user would instead require
-the setuid `newuidmap`/`newgidmap` helpers (from the `uidmap` package) reading
-`/etc/subuid` / `/etc/subgid` — but the single-uid self-map we need does not.
+Three gotchas: the real uid/gid must be read **before** the `unshare`, because
+immediately after it (and before the maps are written) `getuid`/`getgid` report
+the overflow id, which would produce a bogus, rejected map; `gid_map` is rejected
+unless `setgroups` is set to `"deny"` first; and the maps must be written before
+the mapped process relies on the new identity. Mapping a *range* of uids or some
+*other* user would instead require the setuid `newuidmap`/`newgidmap` helpers
+(from the `uidmap` package) reading `/etc/subuid` / `/etc/subgid` — but the
+single-uid self-map we need does not.
+
+#### Approach B — capability on the binary (fallback)
+
+If the kernel forbids unprivileged user namespaces (e.g. Ubuntu's
+`kernel.apparmor_restrict_unprivileged_userns`, or
+`kernel.unprivileged_userns_clone=0`), `unshare(CLONE_NEWUSER)` returns `EPERM`.
+`airgap` then falls back to unsharing a plain mount namespace, which works if the
+binary has been granted `CAP_SYS_ADMIN`:
+
+```
+setcap cap_sys_admin+ep "$(command -v airgap)"
+```
+
+`+ep` makes the capability **e**ffective and **p**ermitted whenever the binary
+runs, so it is needed at most once (re-run after each `cargo install`, since the
+capability is an attribute of the file and is lost when the binary is replaced).
+
+If neither path is available, `airgap` does not fail with a bare `EPERM` partway
+through setup: it maps the `EPERM` to an actionable message naming how to enable
+unprivileged user namespaces or grant the capability, then exits.
 
 ### FUSE overlay
 
@@ -510,13 +523,13 @@ What the overlay covers well, and the residual gaps:
    backend in a **separate PID namespace** (and/or as a uid the child can't
    `ptrace`/inspect) so its `/proc/<pid>/fd` isn't reachable.
 2. **Privileged unmount / re-bind.** With the unprivileged-user-namespace
-   approach (Approach B) the child can hold `CAP_SYS_ADMIN` over the mount
-   namespace and could `umount` the overlay or bind the directory elsewhere,
-   exposing the originals underneath. Mitigation: **lock** the overlay
-   (`MNT_LOCKED`) in an outer namespace and run the child in a nested one where it
-   can't unmount or move it. With Approach A the exec'd child is unprivileged (the
-   file capability is not inherited across `exec`) and simply cannot unmount. *Not
-   yet implemented.*
+   approach (Approach A, the default) the child inherits the user namespace and so
+   holds `CAP_SYS_ADMIN` over the mount namespace; it could `umount` the overlay
+   or bind the directory elsewhere, exposing the originals underneath. Mitigation:
+   **lock** the overlay (`MNT_LOCKED`) in an outer namespace and run the child in a
+   nested one where it can't unmount or move it. With the capability-on-the-binary
+   fallback (Approach B) the exec'd child is unprivileged (the file capability is
+   not inherited across `exec`) and simply cannot unmount. *Not yet implemented.*
 3. **Files outside the overlaid trees.** Only the working directory and `$HOME`
    are overlaid. A secret read by **absolute path outside** both (`/etc/...`, a
    sibling project dir, a system service's data dir), or a hard link from inside
@@ -539,8 +552,8 @@ asserts it fails.**
 
 1. Parent resolves `<program>`'s [profile](#per-program-profiles) (unless
    `--profile`/`--allow-unknown-program` was passed) and exits non-zero if the
-   program is unrecognized, before any privileged setup. Then it unshares the
-   mount namespace and sets mounts private.
+   program is unrecognized, before any namespace setup. Then it unshares the user
+   + mount namespaces (writing its id maps), and sets mounts private.
 2. Parent computes the target roots (`{cwd, $HOME}`, de-duplicated). For each, it
    opens an `O_PATH` fd to the root and mounts a FUSE overlay over it (on a
    background thread), then re-enters the cwd so it resolves through the overlay.
@@ -601,9 +614,10 @@ edit/add/delete persistence, passthrough, exit code) is covered by the
 integration tests in `test/`, which run the real binary. The fixtures pin `$HOME`
 to the per-test working directory so the suite never mounts over the real home of
 whoever runs it; the disjoint-home test sets `$HOME` to a separate temp dir to
-exercise the second overlay. They need `CAP_SYS_ADMIN`; equivalently the binary
-can be driven under an unprivileged user namespace (`unshare -Urm`), which is how
-the overlay is exercised without `setcap`.
+exercise the second overlay. They need a working namespace setup — which the
+binary obtains by itself via an unprivileged user namespace (the default path, so
+no `setcap` and no privileged test runner), falling back to `CAP_SYS_ADMIN` on
+the binary where user namespaces are disabled.
 
 ## Dependencies
 
@@ -621,7 +635,8 @@ the overlay is exercised without `setcap`.
 
 - Linux with FUSE support (`/dev/fuse`).
 - `CAP_SYS_ADMIN`, obtained via either approach in [Privileges](#privileges):
-  the capability set on the binary (default), or an unprivileged user namespace.
+  an unprivileged user namespace (default, no setup), or the capability set on
+  the binary (fallback for kernels that disable unprivileged user namespaces).
 
 ## Status
 

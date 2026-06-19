@@ -24,6 +24,7 @@ use nix::fcntl::{open, OFlag};
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::stat::Mode;
+use nix::unistd::{getgid, getuid};
 
 use crate::fs::OverlayFs;
 use crate::profiles::Profile;
@@ -123,13 +124,11 @@ fn run(
     profile: &dyn Profile,
     debug: bool,
 ) -> Result<i32> {
-    // New mount namespace, then make the tree private so our overlay doesn't
-    // propagate back to the host's namespace. EPERM here means we lack
-    // CAP_SYS_ADMIN, so turn it into an actionable message.
-    unshare(CloneFlags::CLONE_NEWNS).map_err(|e| match e {
-        Errno::EPERM => anyhow!(missing_cap_sys_admin_msg()),
-        other => anyhow!("unshare(CLONE_NEWNS) failed: {other}"),
-    })?;
+    // Enter a fresh mount namespace, then make the tree private so our overlay
+    // doesn't propagate back to the host's namespace. We get the namespace from
+    // an unprivileged user namespace (no sudo/setcap), falling back to a plain
+    // mount namespace if the kernel forbids that.
+    enter_namespaces()?;
     mount(
         None::<&str>,
         "/",
@@ -233,18 +232,62 @@ fn dedup_targets(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     targets
 }
 
-/// Actionable message for the EPERM that `unshare`/`mount` return when the
-/// binary lacks CAP_SYS_ADMIN, pointing at the one-time `setcap` fix.
-fn missing_cap_sys_admin_msg() -> String {
+/// Acquire a private mount namespace without host privilege.
+///
+/// The preferred path is an unprivileged *user* namespace: inside it the process
+/// holds a full capability set (including `CAP_SYS_ADMIN`), which is enough to
+/// create the mount namespace, make the tree private, and mount the FUSE overlay
+/// — no `sudo` and no `setcap`. The combined `unshare` also creates the new mount
+/// namespace, owned by the user namespace.
+///
+/// If the kernel forbids unprivileged user namespaces (e.g. Ubuntu's AppArmor
+/// restriction, or `kernel.unprivileged_userns_clone=0`), we fall back to a plain
+/// mount namespace, which still works if the binary was granted `CAP_SYS_ADMIN`
+/// via `setcap`. Only if both fail do we surface an actionable message.
+fn enter_namespaces() -> Result<()> {
+    // Capture the real ids *before* unsharing: once inside the new user
+    // namespace, and before its maps are written, getuid/getgid report the
+    // overflow id (nobody, 65534), which would produce a bogus, rejected map.
+    let uid = getuid().as_raw();
+    let gid = getgid().as_raw();
+    match unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS) {
+        Ok(()) => map_ids_to_self(uid, gid).context("configuring user namespace id maps"),
+        // Unprivileged user namespaces are disabled; try a plain mount namespace.
+        Err(Errno::EPERM) => unshare(CloneFlags::CLONE_NEWNS).map_err(|e| match e {
+            Errno::EPERM => anyhow!(missing_privilege_msg()),
+            other => anyhow!("unshare(CLONE_NEWNS) failed: {other}"),
+        }),
+        Err(other) => Err(anyhow!("unshare(CLONE_NEWUSER|CLONE_NEWNS) failed: {other}")),
+    }
+}
+
+/// Identity-map our own uid and gid into the new user namespace, so the child
+/// keeps its real uid/gid (transparency) and accesses to the real files behind
+/// the overlay still resolve as the real user. `setgroups` must be denied before
+/// the `gid_map` write, or an unprivileged write returns EPERM.
+fn map_ids_to_self(uid: u32, gid: u32) -> Result<()> {
+    std::fs::write("/proc/self/setgroups", "deny").context("/proc/self/setgroups")?;
+    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).context("/proc/self/uid_map")?;
+    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).context("/proc/self/gid_map")?;
+    Ok(())
+}
+
+/// Actionable message for when we can get a mount namespace neither from an
+/// unprivileged user namespace nor from `CAP_SYS_ADMIN` on the binary.
+fn missing_privilege_msg() -> String {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "airgap".to_string());
     format!(
-        "missing CAP_SYS_ADMIN, required to create a mount namespace and mount \
-         the FUSE overlay.\n  Grant it to the binary once with:\n\n      sudo \
-         setcap cap_sys_admin+ep {exe}\n\n  \
+        "could not create a mount namespace: unprivileged user namespaces appear \
+         to be disabled, and the binary lacks CAP_SYS_ADMIN.\n\n  \
+         Either enable unprivileged user namespaces (pick what applies):\n\n      \
+         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   # Ubuntu 24.04+\n      \
+         sudo sysctl -w kernel.unprivileged_userns_clone=1               # some Debian/Ubuntu\n\n  \
+         or grant the capability to the binary once:\n\n      \
+         sudo setcap cap_sys_admin+ep {exe}\n\n  \
          (the capability is lost on rebuild/copy, so re-run it after each \
-         `cargo build` or `cargo install`), or run airgap inside an unprivileged user namespace."
+         `cargo build` or `cargo install`)."
     )
 }
 
