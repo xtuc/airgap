@@ -3,7 +3,7 @@ name = "airgap"
 version = "0.1.0"
 edition = "2024"
 authors = ["Sven Sauleau <sven@sauleau.com>"]
-description = "Hide sensitive secrets from AI models, while letting them do their work"
+description = "Security for the modern age of AI: defend against bad AI agents and malicious npm packages"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xtuc/airgap"
 

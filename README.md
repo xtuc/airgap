@@ -1,12 +1,15 @@
 # airgap
 
-Hide secrets from AI agents, while letting them do their work. `airgap`
-launches a target program (e.g. an AI coding agent) inside its own mount
-namespace and transparently replaces secrets (e.g. `.env`, SSH/PGP private
-keys) with redacted versions.
+Security for the modern AI age. Hide secrets from AI agents, while letting them
+do their work. `airgap` launches a target program (e.g. an AI coding agent)
+inside its own mount namespace and transparently replaces secrets (e.g. `.env`,
+SSH/PGP private keys) with redacted versions.
 
 An agent running under `airgap` can still **read** and **modify** the protected
-files, but it never sees the actual secrets.
+files, but it never sees the actual secrets. `airgap` also has an additional
+layer to defend against malicious packages: it asks for your permission when
+unexpected files are being accessed — for instance by a malicious npm install
+script.
 
 ## Protected secrets
 
@@ -24,6 +27,12 @@ More secret types will be added.
 These are redacted anywhere under the **working directory** or your **home
 directory** (`$HOME`) — so both a project's `.env` and `~/.ssh` keys are covered.
 Matching is dynamic: files created after launch are caught too.
+
+## Platform support
+
+- **Linux** — fully supported. `airgap` relies on mount namespaces and a FUSE
+  overlay, which are Linux features.
+- **macOS** — not yet, but incoming.
 
 ## Install
 
@@ -114,3 +123,24 @@ alias opencode="airgap opencode"
 ```
 
 Now `claude` (or `opencode`) transparently runs inside `airgap`.
+
+## Use with npm
+
+Run your package manager under `airgap` to guard against malicious install
+scripts — for example a `postinstall` script that tries to reach for your SSH
+keys or `.env` during `npm install`:
+
+```
+$ airgap npm install
+...
+airgap: npm wants to read the file /home/you/.ssh/id_rsa — allow? [y/N] n
+airgap: npm wants to read the file /home/you/.env — allow? [y/N] n
+```
+
+Answer `n` to reject the access.
+
+Or alias it in your shell config:
+
+```
+alias npm="airgap npm"
+```
