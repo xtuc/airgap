@@ -60,8 +60,9 @@ fn at(rel: &Path) -> &Path {
 enum View {
     /// Proxy the real file unchanged.
     Passthrough,
-    /// `.env`: serve these redacted bytes; writes are merged back.
-    Env(Vec<u8>),
+    /// A mergeable text secret (`.env` / `.npmrc`): serve these redacted bytes;
+    /// writes are merged back through the matching handler.
+    Redacted(HandlerKind, Vec<u8>),
     /// Private key: serve these redacted bytes; read-only.
     Key(Vec<u8>),
     /// A handler matched but failed to redact; fail closed (serve `EIO`).
@@ -72,9 +73,11 @@ enum View {
 enum Handle {
     /// Passthrough: I/O goes straight to the real fd.
     File { fd: OwnedFd },
-    /// `.env`: serve `served`; child writes accumulate in `pending`, merged on
-    /// flush/release back through `fd` onto the original.
-    Env {
+    /// A mergeable text secret (`.env` / `.npmrc`): serve `served`; child writes
+    /// accumulate in `pending`, merged on flush/release back through `fd` onto
+    /// the original via the handler selected by `kind`.
+    Redacted {
+        kind: HandlerKind,
         fd: OwnedFd,
         served: Vec<u8>,
         pending: Option<Vec<u8>>,
@@ -251,10 +254,10 @@ impl OverlayFs {
         let n = pread(fd.as_fd(), &mut prefix, 0).unwrap_or(0);
         match redact::detect(file_name, &prefix[..n]) {
             None => Ok(View::Passthrough),
-            Some(HandlerKind::Env) => {
+            Some(kind @ (HandlerKind::Env | HandlerKind::Npmrc)) => {
                 let original = read_all(fd.as_fd())?;
-                Ok(match redact::redact_env(&original) {
-                    Ok(bytes) => View::Env(bytes),
+                Ok(match redact::redact(kind, &original) {
+                    Ok(bytes) => View::Redacted(kind, bytes),
                     Err(_) => View::Failed,
                 })
             }
@@ -279,7 +282,7 @@ impl OverlayFs {
             let name = rel.file_name().unwrap_or_default();
             match self.view_for(rel, name)? {
                 View::Passthrough => {}
-                View::Env(bytes) | View::Key(bytes) => {
+                View::Redacted(_, bytes) | View::Key(bytes) => {
                     attr.size = bytes.len() as u64;
                     attr.blocks = attr.size.div_ceil(512);
                 }
@@ -292,20 +295,21 @@ impl OverlayFs {
         Ok(attr)
     }
 
-    /// Merge an `.env` handle's pending writes back onto the original. Fails
+    /// Merge a redacted handle's pending writes back onto the original. Fails
     /// closed: a bad parse leaves the original untouched and drops the buffer.
     fn persist(&self, fh: u64) -> Result<(), Errno> {
         let mut handles = self.handles.lock().unwrap();
-        let Some(Handle::Env { fd, served, pending }) = handles.map.get_mut(&fh) else {
+        let Some(Handle::Redacted { kind, fd, served, pending }) = handles.map.get_mut(&fh) else {
             return Ok(());
         };
+        let kind = *kind;
         let Some(written) = pending.take() else {
             return Ok(());
         };
         let original = read_all(fd.as_fd()).map_err(errno)?;
         // Parse/merge BEFORE touching the original — never corrupt on error.
-        let merged = redact::merge_env(&original, &written).map_err(|_| Errno::EIO)?;
-        let view = redact::redact_env(&merged).map_err(|_| Errno::EIO)?;
+        let merged = redact::merge(kind, &original, &written).map_err(|_| Errno::EIO)?;
+        let view = redact::redact(kind, &merged).map_err(|_| Errno::EIO)?;
         ftruncate(fd.as_fd(), 0).map_err(errno)?;
         write_all_at(fd.as_fd(), &merged).map_err(errno)?;
         *served = view;
@@ -473,12 +477,12 @@ impl Filesystem for OverlayFs {
             reply.error(Errno::ENOENT);
             return;
         };
-        // A truncate on an open `.env` handle (e.g. `open(..., "w")`, delivered as
-        // setattr(size) when atomic_o_trunc is off) resizes its pending redacted
-        // view; the merge on flush reconciles it back to the original.
+        // A truncate on an open redacted handle (e.g. `open(..., "w")`, delivered
+        // as setattr(size) when atomic_o_trunc is off) resizes its pending
+        // redacted view; the merge on flush reconciles it back to the original.
         if let (Some(sz), Some(fh)) = (size, fh) {
             let mut handles = self.handles.lock().unwrap();
-            if let Some(Handle::Env { served, pending, .. }) = handles.map.get_mut(&fh.0) {
+            if let Some(Handle::Redacted { served, pending, .. }) = handles.map.get_mut(&fh.0) {
                 pending.get_or_insert_with(|| served.clone()).resize(sz as usize, 0);
                 drop(handles);
                 match self.stat(&rel) {
@@ -513,7 +517,7 @@ impl Filesystem for OverlayFs {
                         }
                     }
                 }
-                Ok(View::Env(_)) => {} // handled via the open handle's pending buffer
+                Ok(View::Redacted(..)) => {} // handled via the open handle's pending buffer
                 Ok(View::Key(_)) => {
                     reply.error(Errno::EROFS);
                     return;
@@ -580,11 +584,12 @@ impl Filesystem for OverlayFs {
                     }
                 }
             }
-            View::Env(served) => {
+            View::Redacted(kind, served) => {
                 // Need read+write to merge the edited view back on flush.
                 match self.open_real(&rel, OFlag::O_RDWR | OFlag::O_CLOEXEC, Mode::empty()) {
                     Ok(fd) => {
-                        Handle::Env {
+                        Handle::Redacted {
+                            kind,
                             fd,
                             // O_TRUNC means the child replaces the whole file:
                             // start its pending buffer empty.
@@ -638,17 +643,29 @@ impl Filesystem for OverlayFs {
             }
         };
         let ino = self.intern(rel.clone());
-        // A freshly created file is empty; only `.env` files get a handler (a new
-        // key file has no header yet). Its redacted view starts empty too. With
-        // redaction disabled it's a plain passthrough.
-        let handle = if self.redact && redact::is_env_file(name) {
-            Handle::Env {
+        // A freshly created file is empty, so only by-name handlers (`.env`,
+        // `.npmrc`) apply — a new key file has no header to sniff yet. Its
+        // redacted view starts empty too. With redaction disabled it's a plain
+        // passthrough.
+        let kind = if self.redact {
+            if redact::is_env_file(name) {
+                Some(HandlerKind::Env)
+            } else if redact::is_npmrc_file(name) {
+                Some(HandlerKind::Npmrc)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let handle = match kind {
+            Some(kind) => Handle::Redacted {
+                kind,
                 fd,
                 served: Vec::new(),
                 pending: Some(Vec::new()),
-            }
-        } else {
-            Handle::File { fd }
+            },
+            None => Handle::File { fd },
         };
         let fh = self.handles.lock().unwrap().insert(handle);
         match self.attr(ino, &rel) {
@@ -677,7 +694,7 @@ impl Filesystem for OverlayFs {
                     Err(e) => reply.error(errno(e)),
                 }
             }
-            Some(Handle::Env { served, pending, .. }) => {
+            Some(Handle::Redacted { served, pending, .. }) => {
                 let bytes = pending.as_ref().unwrap_or(served);
                 let start = (offset as usize).min(bytes.len());
                 let end = start.saturating_add(size as usize).min(bytes.len());
@@ -712,7 +729,7 @@ impl Filesystem for OverlayFs {
                 Err(e) => reply.error(errno(e)),
             },
             // Accumulate into the pending (redacted) buffer; merged on flush.
-            Some(Handle::Env { served, pending, .. }) => {
+            Some(Handle::Redacted { served, pending, .. }) => {
                 let buf = pending.get_or_insert_with(|| served.clone());
                 let end = offset as usize + data.len();
                 if buf.len() < end {

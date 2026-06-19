@@ -144,6 +144,17 @@ fn run(
     // outermost is kept — its overlay already redacts everything beneath it.
     let cwd = std::env::current_dir().context("getting current dir")?;
     let targets = overlay_targets(&cwd);
+    if debug {
+        eprintln!(
+            "airgap[debug]: overlay targets (redaction {}): {}",
+            if profile.redaction() { "on" } else { "off" },
+            targets
+                .iter()
+                .map(|t| t.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // Translate the declarative profile into runtime policy: redaction, and a
     // single directory gate shared across all overlays (so a directory is
@@ -171,6 +182,9 @@ fn run(
         let overlay = OverlayFs::new(root, dir.clone(), redact, gate.clone());
         let session = fuser::spawn_mount2(overlay, dir, &config)
             .with_context(|| format!("mounting overlay at {}", dir.display()))?;
+        if debug {
+            eprintln!("airgap[debug]: mounted FUSE overlay at {}", dir.display());
+        }
         sessions.push(session);
     }
 

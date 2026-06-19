@@ -15,6 +15,11 @@ never sees the actual secrets. So far `airgap` protects:
 - **SSH / PGP private keys** — matched by content (any file starting with a
   private-key header: OpenSSH/ed25519, RSA, EC/PKCS#8, or PGP). The key body is
   redacted while the `BEGIN`/`END` markers are kept.
+- **`.npmrc`** — matched by filename. Auth-token and password values
+  (`_authToken`, `_auth`, `_password`, including the per-registry
+  `//registry/:_authToken` form) are redacted to `<redacted value>`, while
+  registries, scopes, `email`, and comments stay visible; edits are persisted
+  back to the real file.
 
 More secret types will be added.
 

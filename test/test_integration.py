@@ -41,6 +41,46 @@ def expected_key_redaction(original_text):
     return f"{lines[0]}\n{PLACEHOLDER}\n{lines[-1]}\n"
 
 
+# Credential keys airgap redacts in .npmrc (matched case-insensitively against
+# the key's suffix), mirroring `redact::is_npmrc_secret_key`.
+NPMRC_SECRET_SUFFIXES = ("_authtoken", "_auth", "_password")
+
+
+def _is_npmrc_comment(line):
+    return line.lstrip().startswith(("#", ";"))
+
+
+def _is_npmrc_secret_key(key):
+    return key.strip().lower().endswith(NPMRC_SECRET_SUFFIXES)
+
+
+def parse_npmrc(text):
+    """Parse `.npmrc` into a dict, skipping comments. Values are kept verbatim
+    (npmrc keys like `//registry/:_authToken` are themselves meaningful)."""
+    out = {}
+    for line in text.splitlines():
+        if _is_npmrc_comment(line) or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value
+    return out
+
+
+def expected_npmrc_redaction(original_text):
+    """The exact redacted view airgap should serve for a given .npmrc: secret
+    values replaced by the placeholder, every other line (registries, scopes,
+    email, comments, blanks) preserved verbatim."""
+    out = []
+    for line in original_text.split("\n"):
+        if not _is_npmrc_comment(line) and "=" in line:
+            key, _, _value = line.partition("=")
+            if _is_npmrc_secret_key(key):
+                out.append(f"{key}={PLACEHOLDER}")
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
 # --- child-program allowlist -----------------------------------------------
 
 # The allowlist check runs *before* any privileged namespace setup, so these
