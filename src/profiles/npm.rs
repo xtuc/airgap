@@ -63,11 +63,17 @@ pub fn preapproved_paths(home: Option<&Path>, cwd: Option<&Path>) -> Vec<String>
         paths.push(home.join(".npm/_cacache"));
         paths.push(home.join(".npm/_update-notifier-last-checked"));
         paths.push(home.join(".gitconfig"));
+        // npm reads the user `.npmrc` for registry/scope config on virtually
+        // every command; its credential values are redacted by the FUSE overlay,
+        // so allowing the read (rather than prompting each run) is safe.
+        paths.push(home.join(".npmrc"));
     }
     if let Some(cwd) = cwd {
         paths.push(cwd.join("node_modules"));
         paths.push(cwd.join("package.json"));
         paths.push(cwd.join("package-lock.json"));
+        // The project-local `.npmrc`, likewise redacted.
+        paths.push(cwd.join(".npmrc"));
     }
     paths
         .iter()
@@ -222,9 +228,11 @@ mod tests {
                 "/home/u/.npm/_cacache".to_string(),
                 "/home/u/.npm/_update-notifier-last-checked".to_string(),
                 "/home/u/.gitconfig".to_string(),
+                "/home/u/.npmrc".to_string(),
                 "/work/proj/node_modules".to_string(),
                 "/work/proj/package.json".to_string(),
                 "/work/proj/package-lock.json".to_string(),
+                "/work/proj/.npmrc".to_string(),
             ]
         );
         // Each source contributes independently; both missing ⇒ empty.
@@ -234,6 +242,7 @@ mod tests {
                 "/work/proj/node_modules".to_string(),
                 "/work/proj/package.json".to_string(),
                 "/work/proj/package-lock.json".to_string(),
+                "/work/proj/.npmrc".to_string(),
             ]
         );
         assert!(preapproved_paths(None, None).is_empty());

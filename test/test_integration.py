@@ -146,6 +146,22 @@ def test_npm_profile_allows_preapproved_path_without_prompting(airgap):
     assert result.stdout == '{"name":"demo"}\n'
 
 
+def test_npm_profile_reads_npmrc_ungated_and_redacted(airgap):
+    # `.npmrc` is pre-approved for the npm profile (npm reads it constantly), so
+    # the read succeeds with no controlling terminal — yet credentials are still
+    # redacted by the overlay, which is why allowing it is safe.
+    expected = expected_npmrc_redaction((airgap.workdir / ".npmrc").read_text())
+    result = airgap(
+        "cat",
+        ".npmrc",
+        airgap_flags=["--profile", "npm"],
+        start_new_session=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+    assert "npm_fake0123456789abcdefghijKLMNOPqrstuv" not in result.stdout
+
+
 # --- agent profile: redaction, no gate -------------------------------------
 
 
