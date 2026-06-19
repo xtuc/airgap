@@ -61,6 +61,7 @@ pub fn preapproved_paths(home: Option<&Path>, cwd: Option<&Path>) -> Vec<String>
     if let Some(home) = home {
         paths.push(home.join(".npm/_logs"));
         paths.push(home.join(".npm/_cacache"));
+        paths.push(home.join(".npm/_update-notifier-last-checked"));
         paths.push(home.join(".gitconfig"));
     }
     if let Some(cwd) = cwd {
@@ -219,6 +220,7 @@ mod tests {
             vec![
                 "/home/u/.npm/_logs".to_string(),
                 "/home/u/.npm/_cacache".to_string(),
+                "/home/u/.npm/_update-notifier-last-checked".to_string(),
                 "/home/u/.gitconfig".to_string(),
                 "/work/proj/node_modules".to_string(),
                 "/work/proj/package.json".to_string(),
