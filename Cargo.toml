@@ -1,6 +1,6 @@
 [package]
 name = "airgap"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["Sven Sauleau <sven@sauleau.com>"]
 description = "Security for the modern age of AI: defend against bad AI agents and malicious npm packages"
