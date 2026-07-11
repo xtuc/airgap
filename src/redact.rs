@@ -41,6 +41,9 @@ pub enum HandlerKind {
     Npmrc,
     /// Private key: redact the body on read; read-only.
     PrivateKey,
+    /// airgap MitM config (`mitm.yaml`): redact every header *value* on read
+    /// (header names and everything else stay visible); read-only.
+    MitmYaml,
 }
 
 /// Private-key header lines we recognise by content sniffing. A file whose first
@@ -73,6 +76,13 @@ pub fn is_npmrc_file(file_name: &OsStr) -> bool {
     file_name.to_str() == Some(".npmrc")
 }
 
+/// Whether a filename is the airgap MitM config (`mitm.yaml`, under the XDG
+/// config dir or cwd). Its header *values* are secrets (tokens injected into
+/// requests), so a sandboxed program sees them redacted.
+pub fn is_mitm_config_file(file_name: &OsStr) -> bool {
+    file_name.to_str() == Some("mitm.yaml")
+}
+
 /// Decide which handler applies, cheaply, without reading the whole file: by
 /// filename, or by sniffing the leading bytes for a private-key header (`prefix`
 /// only needs to contain the first line). Returns `None` for ordinary files.
@@ -82,6 +92,9 @@ pub fn detect(file_name: &OsStr, prefix: &[u8]) -> Option<HandlerKind> {
     }
     if is_npmrc_file(file_name) {
         return Some(HandlerKind::Npmrc);
+    }
+    if is_mitm_config_file(file_name) {
+        return Some(HandlerKind::MitmYaml);
     }
     for line in prefix.split(|&b| b == b'\n') {
         let line = String::from_utf8_lossy(line);
@@ -169,6 +182,7 @@ pub fn redact(kind: HandlerKind, original: &[u8]) -> Result<Vec<u8>, RedactError
     match kind {
         HandlerKind::Env => redact_env(original),
         HandlerKind::Npmrc => redact_npmrc(original),
+        HandlerKind::MitmYaml => redact_mitm_yaml(original),
         HandlerKind::PrivateKey => Err(RedactError("private keys are not mergeable".into())),
     }
 }
@@ -179,6 +193,7 @@ pub fn merge(kind: HandlerKind, original: &[u8], written: &[u8]) -> Result<Vec<u
     match kind {
         HandlerKind::Env => merge_env(original, written),
         HandlerKind::Npmrc => merge_npmrc(original, written),
+        HandlerKind::MitmYaml => Err(RedactError("mitm config is read-only".into())),
         HandlerKind::PrivateKey => Err(RedactError("private keys are not mergeable".into())),
     }
 }
@@ -297,6 +312,46 @@ pub fn redact_private_key(original: &[u8]) -> Option<Vec<u8>> {
         .unwrap_or_else(|| begin.replacen("BEGIN", "END", 1));
 
     Some(format!("{begin}\n{PLACEHOLDER}\n{end}\n").into_bytes())
+}
+
+/// Redact every header *value* in the MitM config: parse the YAML, replace each
+/// value inside any `headers:` mapping with the placeholder (header names and
+/// everything else — `host`, structure — stay visible), and re-serialize.
+/// Formatting and comments are not preserved (as with `.env`). Read-only, so
+/// there is no merge counterpart. Fails closed if the bytes aren't valid YAML.
+pub fn redact_mitm_yaml(original: &[u8]) -> Result<Vec<u8>, RedactError> {
+    // An empty (or whitespace-only) file has nothing to redact.
+    if original.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    let mut value: serde_yaml_ng::Value = serde_yaml_ng::from_slice(original)
+        .map_err(|e| RedactError(format!("mitm config is not valid yaml: {e}")))?;
+    redact_headers(&mut value);
+    serde_yaml_ng::to_string(&value)
+        .map(String::into_bytes)
+        .map_err(|e| RedactError(format!("re-serializing mitm config: {e}")))
+}
+
+/// Recursively replace every value inside any mapping keyed `headers` with the
+/// placeholder.
+fn redact_headers(value: &mut serde_yaml_ng::Value) {
+    use serde_yaml_ng::Value;
+    match value {
+        Value::Mapping(map) => {
+            for (key, val) in map.iter_mut() {
+                if key.as_str() == Some("headers")
+                    && let Value::Mapping(headers) = val
+                {
+                    for (_name, hv) in headers.iter_mut() {
+                        *hv = Value::String(PLACEHOLDER.to_string());
+                    }
+                }
+                redact_headers(val);
+            }
+        }
+        Value::Sequence(seq) => seq.iter_mut().for_each(redact_headers),
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -594,5 +649,46 @@ mod tests {
         let original = b"//registry.npmjs.org/:_authToken=npm_secret\n";
         assert!(merge_npmrc(original, &[0xff]).is_err());
         assert!(merge_npmrc(&[0xff], b"x=y\n").is_err());
+    }
+
+    // --- mitm.yaml ---
+
+    #[test]
+    fn mitm_config_file_name_matching() {
+        assert!(is_mitm_config_file(OsStr::new("mitm.yaml")));
+        assert!(!is_mitm_config_file(OsStr::new("airgap-mitm.yaml")));
+        assert!(!is_mitm_config_file(OsStr::new("mitm.yml")));
+        assert!(!is_mitm_config_file(OsStr::new("other.yaml")));
+        // Detected by name.
+        assert_eq!(detect(OsStr::new("mitm.yaml"), b"rules: []"), Some(HandlerKind::MitmYaml));
+    }
+
+    #[test]
+    fn mitm_yaml_redacts_header_values_keeps_names_and_host() {
+        let input = b"rules:\n\
+            - host: httpbin.org\n\
+            \x20 headers:\n\
+            \x20   X-Airgap-Test: rewritten-by-airgap\n\
+            \x20   Authorization: Bearer sk-secret-token\n";
+        let out = String::from_utf8(redact_mitm_yaml(input).unwrap()).unwrap();
+        // Header names + host remain; values are gone.
+        assert!(out.contains("host: httpbin.org"));
+        assert!(out.contains("X-Airgap-Test:"));
+        assert!(out.contains("Authorization:"));
+        assert!(out.contains(PLACEHOLDER));
+        assert!(!out.contains("rewritten-by-airgap"));
+        assert!(!out.contains("sk-secret-token"));
+    }
+
+    #[test]
+    fn mitm_yaml_empty_input_yields_empty_output() {
+        assert!(redact_mitm_yaml(b"").unwrap().is_empty());
+        assert!(redact_mitm_yaml(b"   \n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn mitm_yaml_fails_closed_on_invalid_yaml() {
+        // `: :` is not valid YAML → redaction errors (caller fails closed).
+        assert!(redact_mitm_yaml(b"rules: [\n  - host: x\n : :\n").is_err());
     }
 }

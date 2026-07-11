@@ -9,6 +9,7 @@
 
 mod fs;
 mod logging;
+mod mitm;
 mod profiles;
 mod redact;
 
@@ -55,6 +56,23 @@ struct Cli {
     /// ($XDG_STATE_HOME/airgap/airgap.log, else ~/.local/state/airgap/airgap.log).
     #[arg(long, value_name = "PATH")]
     log_file: Option<PathBuf>,
+
+    /// Enable the experimental network interception (MitM): transparently
+    /// intercept the child's HTTPS traffic and rewrite request headers per the
+    /// config. Off unless this flag is passed.
+    #[arg(long)]
+    mitm: bool,
+
+    /// Path to the MitM header-rewrite config (YAML). Required with `--mitm`
+    /// and meaningless without it: there is no default location and no search
+    /// path, so the file to use is always the one named here.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "mitm",
+        required_if_eq("mitm", "true")
+    )]
+    mitm_config: Option<PathBuf>,
 
     /// The program to run, followed by its arguments.
     //
@@ -115,7 +133,10 @@ fn main() {
         }
     };
 
-    match run(program, program_args, profile.as_ref()) {
+    // clap ties the two flags together — `--mitm` requires a config path and a
+    // config without `--mitm` is rejected — so the config being `Some` is
+    // exactly "intercept, using this file", and `--mitm` needs no further check.
+    match run(program, program_args, profile.as_ref(), cli.mitm_config) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("airgap: {e:#}");
@@ -132,7 +153,25 @@ fn run(
     program: &OsString,
     program_args: &[OsString],
     profile: &dyn Profile,
+    mitm_config: Option<PathBuf>,
 ) -> Result<i32> {
+    // Build the TLS machinery *before* entering namespaces (it spawns no
+    // threads, so the single-threaded `unshare(CLONE_NEWUSER)` below still works;
+    // and it reads the config + host trust store against the real filesystem).
+    // The netns + user-space stack are started later, once we hold CAP_NET_ADMIN
+    // in our user namespace. Only runs when `--mitm` was passed (mitm_config is
+    // Some); if setup fails we log and run with FUSE only.
+    let mut mitm = match &mitm_config {
+        Some(config) => match mitm::setup(config) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                log::warn!("MitM disabled: {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+
     // Enter a fresh mount namespace, then make the tree private so our overlay
     // doesn't propagate back to the host's namespace. We get the namespace from
     // an unprivileged user namespace (no sudo/setcap), falling back to a plain
@@ -192,17 +231,56 @@ fn run(
         sessions.push(session);
     }
 
+    // Bring up the child's network namespace + user-space stack now: we hold
+    // CAP_NET_ADMIN in our user namespace, and this thread has finished the
+    // single-threaded `unshare(CLONE_NEWUSER)`, so the per-thread netns unshare
+    // inside is safe. The child joins the netns via a `setns` pre_exec hook.
+    if let Some(m) = mitm.as_mut() {
+        m.start_netstack().context("starting MitM network stack")?;
+    }
+
     // Our cwd was opened before the mounts, so it still points at the
     // *underlying* directory; re-enter the path so it (and the child that
     // inherits it) resolves through the overlay. Otherwise relative accesses
     // would bypass redaction.
+    // Expose our ephemeral CA to the child as the on-disk system trust store:
+    // bind-mount the augmented bundle (real roots + our CA) over the distro's
+    // bundle. This is namespace-local, so the host store is untouched, and it
+    // covers any TLS stack that reads the system store (OpenSSL, curl, Go, …)
+    // without per-tool env vars. (The child's resolver is pointed at the stack's
+    // stub separately, in its own mount namespace via the pre_exec hook, so
+    // airgap's proxy keeps the host resolver for upstream DNS.)
+    if let Some(m) = &mitm {
+        let target = mitm::SYSTEM_CA_BUNDLE;
+        if Path::new(target).exists() {
+            mount(
+                Some(m.ca_bundle_path.as_path()),
+                target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .with_context(|| format!("bind-mounting MitM CA bundle over {target}"))?;
+            log::debug!("bind-mounted MitM CA bundle over {target}");
+        } else {
+            log::debug!("{target} absent; relying on CA env vars only");
+        }
+    }
+
     std::env::set_current_dir(&cwd)
         .with_context(|| format!("re-entering working directory {}", cwd.display()))?;
 
+    // Start the MitM proxy (in the init netns, so upstream has real egress) that
+    // consumes the byte streams the stack accepts.
+    if let Some(m) = mitm.as_mut() {
+        m.start_proxy().context("starting MitM proxy")?;
+    }
+
     // Run the child (inherits our namespace and cwd, so it sees the overlays),
     // then unmount regardless of how it went.
-    let result = spawn_and_wait(program, program_args);
+    let result = spawn_and_wait(program, program_args, mitm.as_ref());
     drop(sessions); // unmounts every overlay
+    drop(mitm); // stops the stack/proxy threads (process teardown), removes temp files
     result
 }
 
@@ -255,6 +333,7 @@ fn enter_namespaces() -> Result<()> {
     // overflow id (nobody, 65534), which would produce a bogus, rejected map.
     let uid = getuid().as_raw();
     let gid = getgid().as_raw();
+
     match unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS) {
         Ok(()) => map_ids_to_self(uid, gid).context("configuring user namespace id maps"),
         // Unprivileged user namespaces are disabled; try a plain mount namespace.
@@ -297,9 +376,42 @@ fn missing_privilege_msg() -> String {
 }
 
 /// Spawn the child, wait for it, and return its exit code (signal → 128 + signo).
-fn spawn_and_wait(program: &OsString, program_args: &[OsString]) -> Result<i32> {
-    let status = Command::new(program)
-        .args(program_args)
+///
+/// When the MitM is active, the child gets our ephemeral CA pointed to by the
+/// common TLS-trust env vars, and a `pre_exec` hook that joins the network
+/// namespace so (and only so) its traffic is routed through the user-space stack.
+fn spawn_and_wait(
+    program: &OsString,
+    program_args: &[OsString],
+    mitm: Option<&mitm::Mitm>,
+) -> Result<i32> {
+    let mut cmd = Command::new(program);
+    cmd.args(program_args);
+
+    if let Some(m) = mitm {
+        // The system trust store is already covered by the bind-mount above, but
+        // several stacks read an env var *instead of* the system store — and if
+        // one is already set in the inherited environment (e.g. SSL_CERT_FILE
+        // pointing at a VPN's bundle) it silently wins over our bind-mount. So
+        // point them all at our augmented bundle (real roots + our CA), which is
+        // a superset and overrides any inherited value:
+        //   - SSL_CERT_FILE / CURL_CA_BUNDLE — OpenSSL & curl (and wget, python `ssl`)
+        //   - REQUESTS_CA_BUNDLE — Python `requests` (certifi)
+        //   - NODE_EXTRA_CA_CERTS — Node (appends our bare CA to its bundled roots)
+        cmd.env("SSL_CERT_FILE", &m.ca_bundle_path)
+            .env("CURL_CA_BUNDLE", &m.ca_bundle_path)
+            .env("REQUESTS_CA_BUNDLE", &m.ca_bundle_path)
+            .env("NODE_EXTRA_CA_CERTS", &m.ca_path);
+
+        let hook = m.child_setup_hook()?;
+        // SAFETY: the hook is async-signal-safe (setns/unshare/mount on
+        // pre-opened fds and pre-built strings; no allocation).
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut cmd, hook);
+        }
+    }
+
+    let status = cmd
         .status()
         .with_context(|| format!("running {program:?}"))?;
     Ok(match status.code() {
@@ -413,6 +525,20 @@ mod tests {
         assert_eq!(cli.log_file.as_deref(), Some(Path::new("/tmp/x.log")));
         // None by default (logging falls back to the XDG default).
         assert!(parse(&["npm"]).unwrap().log_file.is_none());
+    }
+
+    #[test]
+    fn mitm_and_mitm_config_require_each_other() {
+        let cli = parse(&["--mitm", "--mitm-config", "/tmp/m.yaml", "npm"]).unwrap();
+        assert!(cli.mitm);
+        assert_eq!(cli.mitm_config.as_deref(), Some(Path::new("/tmp/m.yaml")));
+        // There is no default location, so neither flag works alone.
+        assert!(parse(&["--mitm", "npm"]).is_err());
+        assert!(parse(&["--mitm-config", "/tmp/m.yaml", "npm"]).is_err());
+        // Off by default: no interception, no config.
+        let cli = parse(&["npm"]).unwrap();
+        assert!(!cli.mitm);
+        assert!(cli.mitm_config.is_none());
     }
 
     #[test]

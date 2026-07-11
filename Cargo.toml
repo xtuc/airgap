@@ -9,9 +9,23 @@ repository = "https://github.com/xtuc/airgap"
 
 [dependencies]
 fuser = "0.17"
-nix = { version = "0.31", features = ["mount", "sched", "process", "signal", "fs", "uio", "dir", "user"] }
+nix = { version = "0.31", features = ["mount", "sched", "process", "signal", "fs", "uio", "dir", "user", "net"] }
 dotenvy = "0.15"
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
+libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros", "time"] }
+tokio-util = "0.7"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+rcgen = "0.13"
+httparse = "1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml_ng = "0.10.0"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp",
+] }
+rtnetlink = "0.14"

@@ -8,8 +8,17 @@ Program names are passed bare (`cat`, `sh`, `python3`, ...); airgap resolves the
 against PATH, so we don't hard-code absolute paths.
 """
 
+import http.server
+import json
+import os
+import shutil
+import socket
+import socketserver
+import ssl
 import subprocess
 import textwrap
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -457,3 +466,175 @@ def test_private_key_redacted(airgap, path):
     result = airgap("cat", path)
     assert result.returncode == 0
     assert result.stdout == expected
+
+
+# --- MitM: HTTPS header rewriting (--mitm) ---------------------------------
+#
+# End-to-end through the real binary, no airgap test hooks: a local Python HTTPS
+# echo server stands in for httpbin, and `airgap --mitm curl https://…` rewrites
+# request headers per a mitm.yaml before they reach it.
+#
+# The wrapped curl runs in airgap's network namespace, where its only route is
+# the user-space stack; a connection is intercepted only if it leaves via that
+# stack (dialing STACK_IP), which happens when the name resolves — through the
+# child's stub resolver — to the stack. The stub answers *every* query with the
+# stack address, so any non-local name is intercepted; `localhost` is NOT (glibc
+# resolves it to 127.0.0.1 itself, so it goes to the namespace's own loopback,
+# which the stack doesn't own). airgap's proxy then re-resolves the same name via
+# the *host* resolver to reach the real upstream. `localtest.me` threads both
+# needles: a public name that resolves to loopback, so the host side reaches our
+# local server, with no /etc/hosts edit (root) and no changes to airgap.
+MITM_HOST = "localtest.me"
+
+
+def _resolves_to_loopback(host):
+    """True if `host` resolves, and only to loopback addresses."""
+    try:
+        infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+    return bool(infos) and all(ai[4][0] in ("127.0.0.1", "::1") for ai in infos)
+
+
+def _mint_certs(dirpath, host):
+    """Mint a throwaway CA and a leaf cert for `host` with openssl. Returns
+    (ca_pem, server_pem, server_key). Kept out of $HOME/cwd by the caller so
+    airgap's own key redaction (content-sniffed) doesn't rewrite the key files."""
+
+    def openssl(*args):
+        subprocess.run(["openssl", *args], check=True, capture_output=True)
+
+    ca_key, ca = dirpath / "ca.key", dirpath / "ca.pem"
+    key, csr, cert, ext = (
+        dirpath / "server.key",
+        dirpath / "server.csr",
+        dirpath / "server.pem",
+        dirpath / "ext.cnf",
+    )
+    openssl("genrsa", "-out", str(ca_key), "2048")
+    openssl("req", "-x509", "-new", "-key", str(ca_key), "-out", str(ca),
+            "-subj", "/CN=airgap-test-ca", "-days", "1",
+            "-addext", "basicConstraints=critical,CA:TRUE")
+    openssl("genrsa", "-out", str(key), "2048")
+    openssl("req", "-new", "-key", str(key), "-out", str(csr), "-subj", f"/CN={host}")
+    ext.write_text(f"subjectAltName=DNS:{host}\n")
+    openssl("x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key),
+            "-CAcreateserial", "-out", str(cert), "-days", "1", "-extfile", str(ext))
+    return ca, cert, key
+
+
+class _EchoHandler(http.server.BaseHTTPRequestHandler):
+    """Reflects the request headers back as JSON, httpbin `/headers` style."""
+
+    def do_GET(self):
+        body = json.dumps({"headers": dict(self.headers.items())}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class _V6EchoServer(socketserver.ThreadingTCPServer):
+    # Bind IPv6 dual-stack so the host reaches it as both ::1 and 127.0.0.1
+    # (getaddrinfo may hand airgap's proxy either).
+    address_family = socket.AF_INET6
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+@pytest.fixture
+def https_echo_server(tmp_path_factory):
+    """A local HTTPS server (cert valid for MITM_HOST) reflecting request headers.
+    Yields (host, port, ca_path). Skips when the environment can't support the
+    end-to-end MitM path."""
+    if not shutil.which("openssl"):
+        pytest.skip("openssl not available to mint test certs")
+    if not shutil.which("curl"):
+        pytest.skip("curl not installed")
+    if not os.path.exists("/dev/net/tun"):
+        pytest.skip("/dev/net/tun absent — MitM interception unavailable")
+    if not _resolves_to_loopback(MITM_HOST):
+        pytest.skip(f"{MITM_HOST} does not resolve to loopback (needs DNS)")
+
+    certdir = tmp_path_factory.mktemp("mitm_certs")
+    ca, cert, key = _mint_certs(certdir, MITM_HOST)
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    srv = _V6EchoServer(("::", 0), _EchoHandler)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield SimpleNamespace(host=MITM_HOST, port=port, ca=ca)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_mitm_overrides_and_appends_headers(airgap, https_echo_server):
+    srv = https_echo_server
+    # One rule: override a header curl already sends, and append one it doesn't.
+    cfg = airgap.workdir / "mitm.yaml"
+    cfg.write_text(textwrap.dedent(f"""\
+        rules:
+          - host: {srv.host}
+            headers:
+              X-Existing-Header: overridden-by-airgap
+              X-Added-Header: added-by-airgap
+        """))
+
+    # SSL_CERT_FILE points airgap's *upstream* leg at our throwaway CA (a real,
+    # documented airgap env var — not a test hook). The child curl's own trust is
+    # set separately by airgap to the ephemeral MitM CA, so this doesn't leak in.
+    result = airgap(
+        "curl", "--ipv4", "-sS", "-m", "20",
+        f"https://{srv.host}:{srv.port}/",
+        "-H", "X-Existing-Header: original",
+        airgap_flags=["--mitm", "--mitm-config", str(cfg)],
+        env={"SSL_CERT_FILE": str(srv.ca)},
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stderr
+
+    echoed = json.loads(result.stdout)["headers"]
+    headers = {k.lower(): v for k, v in echoed.items()}
+    # Override: the value curl sent is replaced, not duplicated.
+    assert headers["x-existing-header"] == "overridden-by-airgap"
+    assert "original" not in result.stdout
+    # Append: a header curl never sent is injected.
+    assert headers["x-added-header"] == "added-by-airgap"
+    # Untouched headers pass through.
+    assert "curl/" in headers["user-agent"]
+
+
+def test_mitm_leaves_unmatched_hosts_alone(airgap, https_echo_server):
+    # A config whose only rule targets a *different* host must not touch this
+    # request: the header curl sends arrives verbatim and nothing is injected.
+    srv = https_echo_server
+    cfg = airgap.workdir / "mitm.yaml"
+    cfg.write_text(textwrap.dedent("""\
+        rules:
+          - host: some-other-host.example
+            headers:
+              X-Added-Header: should-not-appear
+        """))
+
+    result = airgap(
+        "curl", "--ipv4", "-sS", "-m", "20",
+        f"https://{srv.host}:{srv.port}/",
+        "-H", "X-Existing-Header: original",
+        airgap_flags=["--mitm", "--mitm-config", str(cfg)],
+        env={"SSL_CERT_FILE": str(srv.ca)},
+        timeout=40,
+    )
+    assert result.returncode == 0, result.stderr
+
+    headers = {k.lower(): v for k, v in json.loads(result.stdout)["headers"].items()}
+    assert headers["x-existing-header"] == "original"  # untouched
+    assert "x-added-header" not in headers  # rule for another host didn't fire

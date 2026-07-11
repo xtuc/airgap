@@ -83,6 +83,57 @@ airgap: npm wants to read the file /home/you/.env — allow? [y/N] n
 
 Answer `n` to reject the access.
 
+## Network interception
+
+With the `--mitm` flag, `airgap` can transparently intercept the wrapped
+program's HTTPS traffic, decrypt it, rewrite request headers per a YAML rule
+set, and re-encrypt it to the real server. The client validates TLS normally — it
+just trusts an ephemeral CA that `airgap` installs into the sandbox for the
+duration of the run.
+
+The wrapped program is placed in a private network namespace, and a user-space
+TCP/IP stack + TLS proxy does the interception.
+
+### Configure the rules
+
+Rules live in a YAML file you name with `--mitm-config <path>`. There is no
+default location and no search path — `--mitm` requires the flag, so the file in
+effect is always the one on the command line. The examples below use the
+in-repo `./mitm.yaml`:
+
+```yaml
+rules:
+  - host: httpbin.org                    # matched exactly against the request's Host
+    headers:                             # (case-insensitive, no subdomains); first match wins
+      X-Airgap-Test: rewritten-by-airgap # override if present, add if absent
+      X-Injected-By: airgap
+```
+
+A request whose `Host` header matches a rule gets that rule's headers applied.
+Because header values can themselves be secrets, `mitm.yaml` is also
+redacted when read from inside the sandbox (values become `<redacted value>`).
+
+### Run it
+
+```
+$ airgap --mitm --mitm-config ./mitm.yaml --allow-unknown-program \
+    curl -H 'X-Airgap-Test: original' https://httpbin.org/headers
+{
+  "headers": {
+    "Accept": "*/*",
+    "Host": "httpbin.org",
+    "User-Agent": "curl/8.5.0",
+    "X-Airgap-Test": "rewritten-by-airgap",
+    "X-Injected-By": "airgap"
+  }
+}
+```
+
+`httpbin` reflects the request headers back: `X-Airgap-Test` comes through as
+`rewritten-by-airgap` (not `original`) and `X-Injected-By: airgap` was added —
+proof the headers were rewritten inside the TLS session even though `curl`
+validated the certificate.
+
 ## Platform support
 
 - **Linux** — fully supported. `airgap` relies on mount namespaces and a FUSE

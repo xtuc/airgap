@@ -301,6 +301,15 @@ impl OverlayFs {
                     None => View::Passthrough,
                 })
             }
+            // Read-only, like a private key: redact header values, or fail
+            // closed (View::Failed) if the YAML won't parse.
+            Some(HandlerKind::MitmYaml) => {
+                let original = read_all(fd.as_fd())?;
+                Ok(match redact::redact_mitm_yaml(&original) {
+                    Ok(bytes) => View::Key(bytes),
+                    Err(_) => View::Failed,
+                })
+            }
         }
     }
 
