@@ -13,3 +13,5 @@ nix = { version = "0.31", features = ["mount", "sched", "process", "signal", "fs
 dotenvy = "0.15"
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"

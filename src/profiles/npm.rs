@@ -98,8 +98,6 @@ type Asker = Box<dyn Fn(&Path, Access) -> bool + Send + Sync>;
 pub struct DirGate {
     state: Mutex<GateState>,
     ask: Asker,
-    /// When set, log each access pre-allowed by the allowlist (a `--debug` aid).
-    debug: bool,
 }
 
 #[derive(Default)]
@@ -115,15 +113,13 @@ struct GateState {
 impl DirGate {
     /// A gate that prompts the controlling terminal, naming `program` in the
     /// prompt so the user knows who is asking. `preapproved` files/directories are
-    /// allowed without prompting (directories cover their descendants). With
-    /// `debug`, each pre-allowed access is logged to stderr.
-    pub fn new(program: String, preapproved: Vec<PathBuf>, debug: bool) -> Self {
-        let mut gate = Self::with_asker(
+    /// allowed without prompting (directories cover their descendants).
+    /// Pre-allowed accesses are logged at debug level via the central logger.
+    pub fn new(program: String, preapproved: Vec<PathBuf>) -> Self {
+        Self::with_asker(
             preapproved,
             Box::new(move |path, access| prompt_tty(&program, path, access)),
-        );
-        gate.debug = debug;
-        gate
+        )
     }
 
     fn with_asker(preapproved: Vec<PathBuf>, ask: Asker) -> Self {
@@ -133,7 +129,6 @@ impl DirGate {
                 denied: Vec::new(),
             }),
             ask,
-            debug: false,
         }
     }
 }
@@ -146,14 +141,12 @@ impl DirAccess for DirGate {
         // questions on the terminal.
         let mut st = self.state.lock().unwrap();
         if let Some(prefix) = st.allowed.iter().find(|p| path.starts_with(p)) {
-            if self.debug {
-                eprintln!(
-                    "airgap[debug]: pre-allowed {} {} (allowlist: {})",
-                    verb(access),
-                    path.display(),
-                    prefix.display()
-                );
-            }
+            log::debug!(
+                "pre-allowed {} {} (allowlist: {})",
+                verb(access),
+                path.display(),
+                prefix.display()
+            );
             return true;
         }
         if st.denied.iter().any(|p| path.starts_with(p)) {

@@ -8,6 +8,7 @@
 //! on access, including files created after launch.
 
 mod fs;
+mod logging;
 mod profiles;
 mod redact;
 
@@ -46,9 +47,14 @@ struct Cli {
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
 
-    /// Log each file access the gate pre-allows (allowlist hits) to stderr.
+    /// Enable debug-level logging (e.g. each file access the gate pre-allows).
     #[arg(long)]
     debug: bool,
+
+    /// Write airgap's own logs to PATH instead of the default
+    /// ($XDG_STATE_HOME/airgap/airgap.log, else ~/.local/state/airgap/airgap.log).
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
 
     /// The program to run, followed by its arguments.
     //
@@ -67,6 +73,10 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
+
+    // Route everything through the centralized logger.
+    logging::init(cli.debug, cli.log_file);
+
     // `required = true` guarantees at least the program is present.
     let (program, program_args) = cli
         .command
@@ -105,7 +115,7 @@ fn main() {
         }
     };
 
-    match run(program, program_args, profile.as_ref(), cli.debug) {
+    match run(program, program_args, profile.as_ref()) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("airgap: {e:#}");
@@ -116,13 +126,12 @@ fn main() {
 
 /// Set up the namespace and FUSE overlays, run the child, tear down, and return
 /// the child's exit code. The `profile` decides redaction and whether a directory
-/// gate is attached (one shared instance consulted by every overlay). `debug`
-/// makes the gate log the accesses it pre-allows.
+/// gate is attached (one shared instance consulted by every overlay). Verbosity
+/// is controlled centrally by the logger (see [`logging`]); `--debug` raises it.
 fn run(
     program: &OsString,
     program_args: &[OsString],
     profile: &dyn Profile,
-    debug: bool,
 ) -> Result<i32> {
     // Enter a fresh mount namespace, then make the tree private so our overlay
     // doesn't propagate back to the host's namespace. We get the namespace from
@@ -143,23 +152,21 @@ fn run(
     // outermost is kept — its overlay already redacts everything beneath it.
     let cwd = std::env::current_dir().context("getting current dir")?;
     let targets = overlay_targets(&cwd);
-    if debug {
-        eprintln!(
-            "airgap[debug]: overlay targets (redaction {}): {}",
-            if profile.redaction() { "on" } else { "off" },
-            targets
-                .iter()
-                .map(|t| t.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
+    log::debug!(
+        "overlay targets (redaction {}): {}",
+        if profile.redaction() { "on" } else { "off" },
+        targets
+            .iter()
+            .map(|t| t.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     // Translate the declarative profile into runtime policy: redaction, and a
     // single directory gate shared across all overlays (so a directory is
     // decided once regardless of which overlay serves it).
     let redact = profile.redaction();
-    let gate = profile.directory_gate(program, debug);
+    let gate = profile.directory_gate(program);
 
     let mut config = Config::default();
     config.mount_options = vec![MountOption::FSName("airgap".into())];
@@ -181,9 +188,7 @@ fn run(
         let overlay = OverlayFs::new(root, dir.clone(), redact, gate.clone());
         let session = fuser::spawn_mount2(overlay, dir, &config)
             .with_context(|| format!("mounting overlay at {}", dir.display()))?;
-        if debug {
-            eprintln!("airgap[debug]: mounted FUSE overlay at {}", dir.display());
-        }
+        log::debug!("mounted FUSE overlay at {}", dir.display());
         sessions.push(session);
     }
 
@@ -400,6 +405,14 @@ mod tests {
         assert_eq!(cli.command, osvec(&["npm", "install"]));
         // Off by default.
         assert!(!parse(&["npm"]).unwrap().debug);
+    }
+
+    #[test]
+    fn parses_log_file_flag() {
+        let cli = parse(&["--log-file", "/tmp/x.log", "npm"]).unwrap();
+        assert_eq!(cli.log_file.as_deref(), Some(Path::new("/tmp/x.log")));
+        // None by default (logging falls back to the XDG default).
+        assert!(parse(&["npm"]).unwrap().log_file.is_none());
     }
 
     #[test]

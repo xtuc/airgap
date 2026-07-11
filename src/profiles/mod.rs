@@ -48,16 +48,15 @@ pub trait Profile {
 
     /// Build the runtime directory gate this profile calls for, if any — the
     /// interactive prompting gate from [`npm`], seeded with the pre-approved
-    /// list. `program` only feeds the prompt text; `debug` makes the gate log the
-    /// accesses it pre-allows. Provided in terms of [`Self::directory_access`], so
-    /// implementations just declare the policy.
-    fn directory_gate(&self, program: &OsStr, debug: bool) -> Option<Arc<dyn DirAccess>> {
+    /// list. `program` only feeds the prompt text. Provided in terms of
+    /// [`Self::directory_access`], so implementations just declare the policy.
+    fn directory_gate(&self, program: &OsStr) -> Option<Arc<dyn DirAccess>> {
         match self.directory_access() {
             DirectoryAccess::AllowAny => None,
             DirectoryAccess::AskAllowList(allowlist) => {
                 let prog = program_basename(program).to_string_lossy().into_owned();
                 let preapproved = allowlist.iter().map(PathBuf::from).collect();
-                Some(Arc::new(npm::DirGate::new(prog, preapproved, debug)) as Arc<dyn DirAccess>)
+                Some(Arc::new(npm::DirGate::new(prog, preapproved)) as Arc<dyn DirAccess>)
             }
         }
     }
@@ -122,7 +121,7 @@ mod tests {
         let p = resolve(OsStr::new("claude")).unwrap();
         assert!(p.redaction());
         assert!(matches!(p.directory_access(), DirectoryAccess::AllowAny));
-        assert!(p.directory_gate(OsStr::new("claude"), false).is_none());
+        assert!(p.directory_gate(OsStr::new("claude")).is_none());
         // basename match works for absolute paths too.
         assert!(resolve(OsStr::new("/usr/bin/opencode")).is_some());
     }
@@ -135,10 +134,10 @@ mod tests {
             p.directory_access(),
             DirectoryAccess::AskAllowList(_)
         ));
-        assert!(p.directory_gate(OsStr::new("npm"), false).is_some());
+        assert!(p.directory_gate(OsStr::new("npm")).is_some());
         assert!(resolve(OsStr::new("/usr/bin/yarn"))
             .unwrap()
-            .directory_gate(OsStr::new("yarn"), false)
+            .directory_gate(OsStr::new("yarn"))
             .is_some());
     }
 
