@@ -31,7 +31,7 @@ use nix::fcntl::{AtFlags, OFlag, openat, readlinkat, renameat};
 use nix::libc;
 use nix::sys::stat::{FileStat, Mode, SFlag, fstatat, mkdirat};
 use nix::sys::uio::{pread, pwrite};
-use nix::unistd::{UnlinkatFlags, ftruncate, symlinkat, unlinkat};
+use nix::unistd::{UnlinkatFlags, ftruncate, linkat, symlinkat, unlinkat};
 
 use crate::redact::{self, HandlerKind};
 
@@ -1029,6 +1029,42 @@ impl Filesystem for OverlayFs {
             Ok(()) => {
                 let ino = self.intern(rel.clone());
                 match self.attr(ino, &rel) {
+                    Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                    Err(e) => reply.error(errno(e)),
+                }
+            }
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let (Some(old_rel), Some(newparent_path)) =
+            (self.path_of(ino), self.path_of(newparent))
+        else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let new_rel = newparent_path.join(newname);
+        // Hardlink on the real underlying files (via root_fd), like every other
+        // *at op here. Empty flags: don't follow a symlink source, matching the
+        // POSIX linkat default.
+        match linkat(
+            self.root_fd(),
+            at(&old_rel),
+            self.root_fd(),
+            at(&new_rel),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => {
+                let new_ino = self.intern(new_rel.clone());
+                match self.attr(new_ino, &new_rel) {
                     Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
                     Err(e) => reply.error(errno(e)),
                 }
