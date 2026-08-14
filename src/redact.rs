@@ -83,10 +83,11 @@ pub fn detect(file_name: &OsStr, prefix: &[u8]) -> Option<HandlerKind> {
     if is_npmrc_file(file_name) {
         return Some(HandlerKind::Npmrc);
     }
-    let first_line = prefix.split(|&b| b == b'\n').next().unwrap_or(prefix);
-    let line = String::from_utf8_lossy(first_line);
-    if KEY_HEADERS.contains(&line.trim_end()) {
-        return Some(HandlerKind::PrivateKey);
+    for line in prefix.split(|&b| b == b'\n') {
+        let line = String::from_utf8_lossy(line);
+        if KEY_HEADERS.contains(&line.trim_end()) {
+            return Some(HandlerKind::PrivateKey);
+        }
     }
     None
 }
@@ -442,6 +443,40 @@ mod tests {
         );
         // Ordinary files are passthrough.
         assert_eq!(detect(OsStr::new("notes.txt"), b"just text\n"), None);
+    }
+
+    #[test]
+    fn detect_finds_key_after_comments() {
+        let input = b"# comment\n-----BEGIN PRIVATE KEY-----\n";
+        assert_eq!(
+            detect(OsStr::new("id_rsa"), input),
+            Some(HandlerKind::PrivateKey)
+        );
+    }
+
+    #[test]
+    fn detect_finds_key_after_blank_lines() {
+        let input = b"\n\n-----BEGIN PRIVATE KEY-----\n";
+        assert_eq!(
+            detect(OsStr::new("id_rsa"), input),
+            Some(HandlerKind::PrivateKey)
+        );
+    }
+
+    #[test]
+    fn detect_finds_key_in_middle_of_content() {
+        let input = b"some config\nfoo=bar\n-----BEGIN RSA PRIVATE KEY-----\n";
+        assert_eq!(
+            detect(OsStr::new("secrets.yaml"), input),
+            Some(HandlerKind::PrivateKey)
+        );
+    }
+
+    #[test]
+    fn detect_skips_key_without_own_line() {
+        // Key header must be on its own line; inline prefix should not match.
+        let input = b"prefix -----BEGIN RSA PRIVATE KEY-----\n";
+        assert_eq!(detect(OsStr::new("id_rsa"), input), None);
     }
 
     #[test]

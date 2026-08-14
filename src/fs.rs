@@ -283,7 +283,7 @@ impl OverlayFs {
             return Ok(View::Passthrough);
         }
         let fd = self.open_real(rel, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty())?;
-        let mut prefix = [0u8; 64];
+        let mut prefix = [0u8; 1024];
         let n = pread(fd.as_fd(), &mut prefix, 0).unwrap_or(0);
         match redact::detect(file_name, &prefix[..n]) {
             None => Ok(View::Passthrough),
