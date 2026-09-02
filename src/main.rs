@@ -59,13 +59,11 @@ struct Cli {
 
     /// Enable the experimental network interception (MitM): transparently
     /// intercept the child's HTTPS traffic and rewrite request headers per the
-    /// config. Off unless this flag is passed.
+    /// config.
     #[arg(long)]
     mitm: bool,
 
-    /// Path to the MitM header-rewrite config (YAML). Required with `--mitm`
-    /// and meaningless without it: there is no default location and no search
-    /// path, so the file to use is always the one named here.
+    /// Path to the MitM header-rewrite config (YAML).
     #[arg(
         long,
         value_name = "PATH",
